@@ -15,6 +15,8 @@ fn test_scxvid_output_compatibility() {
     let mut cmd = Command::cargo_bin("scuisei-rs").unwrap();
     cmd.arg("-i")
         .arg(fixture_path)
+        .arg("--format")
+        .arg("xvid")
         .arg("-o")
         .arg(output_path)
         .assert()
@@ -23,11 +25,23 @@ fn test_scxvid_output_compatibility() {
     let output_content = fs::read_to_string(output_path).unwrap();
     let lines: Vec<&str> = output_content.lines().collect();
 
-    assert_eq!(lines.len(), 4, "expected header + 3 frame decisions");
-    assert_eq!(lines[0], "# XviD 2pass stat file");
-    assert_eq!(lines[1], "i");
-    assert_eq!(lines[2], "p");
-    assert_eq!(lines[3], "p");
+    assert_eq!(
+        lines.len(),
+        6,
+        "expected 2 header lines + spacer + 3 frame decisions"
+    );
+    assert_eq!(
+        lines[0],
+        &format!(
+            "# XviD 2pass stat file (core version scuisei-rs {})",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(lines[1], "# Please do not modify this file");
+    assert_eq!(lines[2], "");
+    assert_eq!(lines[3], "i");
+    assert_eq!(lines[4], "p");
+    assert_eq!(lines[5], "p");
 }
 
 #[test]
@@ -36,9 +50,25 @@ fn test_frames_output() {
     common::ensure_fixture_y4m(fixture_path);
 
     let mut cmd = Command::cargo_bin("scuisei-rs").unwrap();
-    cmd.arg("-i").arg(fixture_path).arg("--frames");
+    cmd.arg("-i")
+        .arg(fixture_path)
+        .arg("--format")
+        .arg("frames");
 
     cmd.assert().success().stdout("0,1,2\n");
+}
+
+#[test]
+fn test_default_output_is_agi() {
+    let fixture_path = Path::new("target/fixtures/test_video.y4m");
+    common::ensure_fixture_y4m(fixture_path);
+
+    let mut cmd = Command::cargo_bin("scuisei-rs").unwrap();
+    cmd.arg("-i").arg(fixture_path);
+
+    cmd.assert()
+        .success()
+        .stdout("# keyframe format v1\nfps 0\n\n0 I -1\n1 I -1\n2 I -1\n");
 }
 
 #[test]
@@ -46,7 +76,8 @@ fn test_missing_input_fails_with_context() {
     let mut cmd = Command::cargo_bin("scuisei-rs").unwrap();
     cmd.arg("-i")
         .arg("target/fixtures/does-not-exist.y4m")
-        .arg("--frames");
+        .arg("--format")
+        .arg("frames");
 
     cmd.assert()
         .failure()

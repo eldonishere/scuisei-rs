@@ -22,9 +22,10 @@ cargo build --release
 
 ```bash
 $ ./scuisei-rs --help
-$ ./scuisei-rs -i input.mp4 -o output.pass
-$ ./scuisei-rs -i input.mp4 --hwdec vaapi > output.pass
-$ ./scuisei-rs -i input.mp4 --frames
+$ ./scuisei-rs -i input.mp4 > output.agi
+$ ./scuisei-rs -i input.mp4 --format xvid -o output.pass
+$ ./scuisei-rs -i input.mp4 --format xvid --hwdec vaapi > output.pass
+$ ./scuisei-rs -i input.mp4 --format frames
 $ ./scuisei-rs -i input.mp4 --native-res # slow - and default thresholds are tuned for the downsampled clip
 ```
 

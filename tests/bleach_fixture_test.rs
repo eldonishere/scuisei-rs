@@ -35,13 +35,14 @@ fn run_frames_output(fixture: &PathBuf) -> Vec<usize> {
         .unwrap()
         .arg("-i")
         .arg(fixture)
-        .arg("--frames")
+        .arg("--format")
+        .arg("frames")
         .output()
-        .expect("failed to run scuisei-rs --frames");
+        .expect("failed to run scuisei-rs --format frames");
 
     assert!(
         output.status.success(),
-        "scuisei-rs --frames failed with status {:?}\nstderr:\n{}",
+        "scuisei-rs --format frames failed with status {:?}\nstderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );

@@ -25,7 +25,7 @@ pub struct AnalyzeOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Final outputs produced by a scene-detection run.
 pub struct AnalysisResult {
-    /// Refined keyframe indices suitable for `--frames` output.
+    /// Refined keyframe indices suitable for AGI or `frames` output.
     pub keyframes: Vec<usize>,
     /// Per-frame `SCXvid` decisions where `true` means `i` and `false` means `p`.
     pub pass_decisions: Vec<bool>,

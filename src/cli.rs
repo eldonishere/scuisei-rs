@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 pub const DEFAULT_WINDOW_SIZE: usize = 30;
@@ -11,6 +11,13 @@ pub const DEFAULT_HIST_WEIGHT: f64 = 0.30;
 pub const DEFAULT_ME_SEARCH_RADIUS: i32 = 4;
 pub const DEFAULT_ME_INTRA_THRESH: i32 = 2000;
 pub const DEFAULT_ME_INTRA_THRESH2: f64 = 90.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    Agi,
+    Xvid,
+    Frames,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -27,9 +34,9 @@ pub struct Cli {
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
-    /// Output a comma-separated list of keyframe indices (instead of .pass format)
-    #[arg(long)]
-    pub frames: bool,
+    /// Output format: agi, xvid, or frames
+    #[arg(long, value_enum, default_value_t = OutputFormat::Agi)]
+    pub format: OutputFormat,
 
     /// Run detection at native resolution instead of the default downscaled working resolution
     #[arg(long)]

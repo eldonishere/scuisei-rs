@@ -1,7 +1,9 @@
 mod common;
 
 use assert_cmd::Command;
-use scuisei_rs::{AnalyzeOptions, SCuiseiError, analyze_video, write_frames_csv, write_pass_log};
+use scuisei_rs::{
+    AnalyzeOptions, SCuiseiError, analyze_video, write_agi, write_frames_csv, write_pass_log,
+};
 use std::fs;
 use std::path::Path;
 
@@ -22,10 +24,24 @@ fn test_library_api_matches_expected_fixture_outputs() {
     let frames_string = String::from_utf8(frames_output).expect("frames output should be UTF-8");
     assert_eq!(frames_string, "0,1,2\n");
 
+    let mut agi_output = Vec::new();
+    write_agi(&mut agi_output, &result.keyframes).expect("agi output should format");
+    let agi_string = String::from_utf8(agi_output).expect("agi output should be UTF-8");
+    assert_eq!(
+        agi_string,
+        "# keyframe format v1\nfps 0\n\n0 I -1\n1 I -1\n2 I -1\n"
+    );
+
     let mut pass_output = Vec::new();
     write_pass_log(&mut pass_output, &result.pass_decisions).expect("pass output should format");
     let pass_string = String::from_utf8(pass_output).expect("pass output should be UTF-8");
-    assert_eq!(pass_string, "# XviD 2pass stat file\ni\np\np\n");
+    assert_eq!(
+        pass_string,
+        format!(
+            "# XviD 2pass stat file (core version scuisei-rs {})\n# Please do not modify this file\n\ni\np\np\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
 }
 
 #[test]
@@ -42,7 +58,10 @@ fn test_cli_and_library_outputs_match() {
         String::from_utf8(expected_frames).expect("frames output should be UTF-8");
 
     let mut cmd = Command::cargo_bin("scuisei-rs").unwrap();
-    cmd.arg("-i").arg(fixture_path).arg("--frames");
+    cmd.arg("-i")
+        .arg(fixture_path)
+        .arg("--format")
+        .arg("frames");
     cmd.assert().success().stdout(expected_frames);
 
     let mut expected_pass = Vec::new();
@@ -51,7 +70,12 @@ fn test_cli_and_library_outputs_match() {
 
     let output_path = "target/output.cli.parity.pass";
     let mut cmd = Command::cargo_bin("scuisei-rs").unwrap();
-    cmd.arg("-i").arg(fixture_path).arg("-o").arg(output_path);
+    cmd.arg("-i")
+        .arg(fixture_path)
+        .arg("--format")
+        .arg("xvid")
+        .arg("-o")
+        .arg(output_path);
     cmd.assert().success();
 
     let actual_pass = fs::read_to_string(output_path).expect("pass file should exist");

@@ -12,6 +12,7 @@ pub mod simd_metrics;
 #[cfg(feature = "python")]
 mod python;
 
+use crate::cli::OutputFormat;
 pub use analysis::{AnalysisResult, AnalyzeOptions, analyze_video};
 pub use detector::{DetectorConfig, XvidDetectorConfig};
 pub use error::{SCuiseiError, SCuiseiResult};
@@ -82,6 +83,24 @@ pub fn write_frames_csv<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuise
     Ok(())
 }
 
+/// Write AGI keyframe format v1 output with a trailing newline.
+///
+/// # Errors
+/// Returns an error if writing to the output stream fails.
+pub fn write_agi<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuiseiResult<()> {
+    writeln!(writer, "# keyframe format v1")
+        .map_err(|error| SCuiseiError::io("failed to write AGI header", &error))?;
+    writeln!(writer, "fps 0")
+        .map_err(|error| SCuiseiError::io("failed to write AGI fps line", &error))?;
+    writeln!(writer).map_err(|error| SCuiseiError::io("failed to write AGI spacer", &error))?;
+
+    for frame in keyframes {
+        writeln!(writer, "{frame} I -1")
+            .map_err(|error| SCuiseiError::io("failed to write AGI keyframe line", &error))?;
+    }
+    Ok(())
+}
+
 /// Write SCXvid-compatible frame decisions (`i`/`p`) to a writer.
 ///
 /// # Errors
@@ -112,10 +131,10 @@ pub fn run_cli<W: Write>(cli: &cli::Cli, writer: &mut W) -> SCuiseiResult<()> {
     let options = AnalyzeOptions::from_cli(cli, dump_scores);
     let result = analyze_video(&options)?;
 
-    if cli.frames {
-        write_frames_csv(writer, &result.keyframes)?;
-    } else {
-        write_pass_log(writer, &result.pass_decisions)?;
+    match cli.format {
+        OutputFormat::Agi => write_agi(writer, &result.keyframes)?,
+        OutputFormat::Xvid => write_pass_log(writer, &result.pass_decisions)?,
+        OutputFormat::Frames => write_frames_csv(writer, &result.keyframes)?,
     }
 
     Ok(())

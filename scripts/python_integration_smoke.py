@@ -29,8 +29,13 @@ def main() -> None:
     assert frames == [0, 1, 2], f"unexpected detect_frames output: {frames}"
 
     pass_output = scuisei_rs.detect_pass(str(fixture))
-    expected = "# XviD 2pass stat file\ni\np\np\n"
-    assert pass_output == expected, f"unexpected detect_pass output: {pass_output!r}"
+    lines = pass_output.splitlines()
+    assert len(lines) >= 6, f"unexpected detect_pass output: {pass_output!r}"
+    assert lines[0].startswith("# XviD 2pass stat file (core version scuisei-rs "), lines
+    assert lines[0].endswith(")"), lines
+    assert lines[1] == "# Please do not modify this file"
+    assert lines[2] == ""
+    assert lines[3:] == ["i", "p", "p"], lines
 
 
 if __name__ == "__main__":

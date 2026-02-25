@@ -20,9 +20,15 @@ impl<'a, W: Write> ScxvidPassFormatter<'a, W> {
         if self.wrote_header {
             return Ok(());
         }
+        writeln!(
+            self.writer,
+            "# XviD 2pass stat file (core version scuisei-rs {})",
+            env!("CARGO_PKG_VERSION")
+        )
+        .context("failed to write scxvid version header")?;
         self.writer
-            .write_all(b"# XviD 2pass stat file\n")
-            .context("failed to write scxvid header")?;
+            .write_all(b"# Please do not modify this file\n\n")
+            .context("failed to write scxvid header comments")?;
         self.wrote_header = true;
         Ok(())
     }
