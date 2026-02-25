@@ -21,7 +21,7 @@ impl<'a, W: Write> ScxvidPassFormatter<'a, W> {
             return Ok(());
         }
         self.writer
-            .write_all(b"# xvid 2pass log file\n")
+            .write_all(b"# XviD 2pass stat file\n")
             .context("failed to write scxvid header")?;
         self.wrote_header = true;
         Ok(())

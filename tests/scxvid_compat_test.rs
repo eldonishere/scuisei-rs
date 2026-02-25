@@ -24,7 +24,7 @@ fn test_scxvid_output_compatibility() {
     let lines: Vec<&str> = output_content.lines().collect();
 
     assert_eq!(lines.len(), 4, "expected header + 3 frame decisions");
-    assert_eq!(lines[0], "# xvid 2pass log file");
+    assert_eq!(lines[0], "# XviD 2pass stat file");
     assert_eq!(lines[1], "i");
     assert_eq!(lines[2], "p");
     assert_eq!(lines[3], "p");

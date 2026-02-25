@@ -25,7 +25,7 @@ fn test_library_api_matches_expected_fixture_outputs() {
     let mut pass_output = Vec::new();
     write_pass_log(&mut pass_output, &result.pass_decisions).expect("pass output should format");
     let pass_string = String::from_utf8(pass_output).expect("pass output should be UTF-8");
-    assert_eq!(pass_string, "# xvid 2pass log file\ni\np\np\n");
+    assert_eq!(pass_string, "# XviD 2pass stat file\ni\np\np\n");
 }
 
 #[test]

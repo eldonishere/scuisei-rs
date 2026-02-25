@@ -29,7 +29,7 @@ def main() -> None:
     assert frames == [0, 1, 2], f"unexpected detect_frames output: {frames}"
 
     pass_output = scuisei_rs.detect_pass(str(fixture))
-    expected = "# xvid 2pass log file\ni\np\np\n"
+    expected = "# XviD 2pass stat file\ni\np\np\n"
     assert pass_output == expected, f"unexpected detect_pass output: {pass_output!r}"
 
 
