@@ -3,6 +3,20 @@ name = "scuisei-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93.1"
+description = "Scene-change detection library and CLI"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/yuv420p10le/scuisei-rs"
+homepage = "https://github.com/yuv420p10le/scuisei-rs"
+documentation = "https://docs.rs/scuisei-rs"
+keywords = ["scene-detection", "video", "ffmpeg", "aegisub"]
+categories = ["command-line-utilities", "multimedia::video"]
+exclude = [
+    ".github/**",
+    ".devcontainer/**",
+    ".venv/**",
+    "dist/**",
+]
 
 [lib]
 name = "scuisei_rs"

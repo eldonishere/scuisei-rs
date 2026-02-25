@@ -1,5 +1,7 @@
 # scuisei-rs
 
+![PyPI](https://img.shields.io/pypi/wheel/scuisei-rs) ![crates.io](https://img.shields.io/crates/msrv/:crate)
+
 Blazing fast successor for [SCXvid](https://github.com/soyokaze/SCXvid-standalone), with arguably better scene change detections than existing solutions. Also outputs compatible `.pass` files.
 Intended for fansubbing (e.g. timing within Aegisub) but may have other uses.
 
