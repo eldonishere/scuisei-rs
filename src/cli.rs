@@ -1,0 +1,82 @@
+use clap::Parser;
+use std::path::PathBuf;
+
+pub const DEFAULT_WINDOW_SIZE: usize = 30;
+pub const DEFAULT_SIGMA: f64 = 3.0;
+pub const DEFAULT_BASE_THRESHOLD: f64 = 0.20;
+pub const DEFAULT_MIN_HIST_DISTANCE: f64 = 0.03;
+pub const DEFAULT_MIN_SCORE: f64 = 0.0;
+pub const DEFAULT_SAD_WEIGHT: f64 = 0.70;
+pub const DEFAULT_HIST_WEIGHT: f64 = 0.30;
+pub const DEFAULT_ME_SEARCH_RADIUS: i32 = 4;
+pub const DEFAULT_ME_INTRA_THRESH: i32 = 2000;
+pub const DEFAULT_ME_INTRA_THRESH2: f64 = 90.0;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "scuisei-rs",
+    about = "SIMD-accelerated scene-change detection (scxvid-compatible output)",
+    version
+)]
+pub struct Cli {
+    /// Input media file
+    #[arg(short = 'i', long)]
+    pub input: PathBuf,
+
+    /// Output .pass file path (defaults to stdout)
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
+
+    /// Output a comma-separated list of keyframe indices (instead of .pass format)
+    #[arg(long)]
+    pub frames: bool,
+
+    /// Run detection at native resolution instead of the default downscaled working resolution
+    #[arg(long)]
+    pub native_res: bool,
+
+    /// Sliding window size (frames) for adaptive thresholding
+    #[arg(long, default_value_t = DEFAULT_WINDOW_SIZE)]
+    pub window_size: usize,
+
+    /// Threshold = mean + sigma * stddev (within the sliding window)
+    #[arg(long, default_value_t = DEFAULT_SIGMA)]
+    pub sigma: f64,
+
+    /// Lower bound for the adaptive threshold
+    #[arg(long, default_value_t = DEFAULT_BASE_THRESHOLD)]
+    pub base_threshold: f64,
+
+    /// Minimum histogram distance gating (helps avoid motion-only false positives)
+    #[arg(long, default_value_t = DEFAULT_MIN_HIST_DISTANCE)]
+    pub min_hist_distance: f64,
+
+    /// Minimum combined score gating (useful during warm-up)
+    #[arg(long, default_value_t = DEFAULT_MIN_SCORE)]
+    pub min_score: f64,
+
+    /// Weight of SAD (normalized to 0..1)
+    #[arg(long, default_value_t = DEFAULT_SAD_WEIGHT)]
+    pub sad_weight: f64,
+
+    /// Weight of histogram distance (0..1)
+    #[arg(long, default_value_t = DEFAULT_HIST_WEIGHT)]
+    pub hist_weight: f64,
+
+    /// Motion-estimation search radius (pixels in the working luma)
+    /// (downscaled by default, or native when --native-res is set)
+    #[arg(long, default_value_t = DEFAULT_ME_SEARCH_RADIUS)]
+    pub me_search_radius: i32,
+
+    /// XviD-like intra threshold (block SAD is "too big" vs. block complexity)
+    #[arg(long, default_value_t = DEFAULT_ME_INTRA_THRESH)]
+    pub me_intra_thresh: i32,
+
+    /// XviD-like intra score threshold (higher => fewer I-frames)
+    #[arg(long, default_value_t = DEFAULT_ME_INTRA_THRESH2)]
+    pub me_intra_thresh2: f64,
+
+    /// Require hardware decoding (no software fallback), e.g. vaapi/qsv/cuda
+    #[arg(long, value_name = "HWDEV")]
+    pub hwdec: Option<String>,
+}

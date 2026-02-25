@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "scuisei-rs"
+version = "0.1.0"
+description = "Scene-change detection library and CLI"
+requires-python = ">=3.9"
+
+[tool.maturin]
+bindings = "pyo3"
+features = ["python"]
+module-name = "scuisei_rs"

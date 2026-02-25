@@ -1,0 +1,30 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+      - id: clippy
+        args:
+          [
+            "--",
+            "-D",
+            "warnings",
+            "-D",
+            "clippy::pedantic",
+            "-D",
+            "clippy::allow_attributes",
+            "-D",
+            "clippy::allow_attributes_without_reason",
+          ]
+  - repo: local
+    hooks:
+      - id: no-rust-allow-attrs
+        name: no-rust-allow-attrs
+        entry: ./scripts/check-no-allow.sh
+        language: system
+        pass_filenames: false

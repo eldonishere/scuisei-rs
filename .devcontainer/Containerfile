@@ -1,0 +1,19 @@
+FROM mcr.microsoft.com/devcontainers/rust:1
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    python3-pip \
+    python3-venv \
+    pre-commit \
+    pkg-config \
+    clang \
+    libclang-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswscale-dev \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*

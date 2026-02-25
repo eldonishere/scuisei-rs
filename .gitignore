@@ -1,0 +1,27 @@
+/target
+
+# py
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# fuzz
+.coverage
+coverage.xml
+htmlcov/
+
+# mac slop
+.DS_Store
+.idea/
+*.swp
+
+# envs
+.vscode/
+.env
+.direnv/

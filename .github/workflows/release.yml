@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  verify_version:
+    name: Verify tag/version alignment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: Parse version from tag
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "value=${tag_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version in Cargo.toml and pyproject.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_version="${{ steps.version.outputs.value }}"
+          cargo_version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          pyproject_version="$(awk -F'"' '/^version = / { print $2; exit }' pyproject.toml)"
+
+          if [ "${tag_version}" != "${cargo_version}" ]; then
+            echo "Tag version (${tag_version}) does not match Cargo.toml (${cargo_version})."
+            exit 1
+          fi
+
+          if [ "${tag_version}" != "${pyproject_version}" ]; then
+            echo "Tag version (${tag_version}) does not match pyproject.toml (${pyproject_version})."
+            exit 1
+          fi
+
+  build_wheels:
+    name: Build wheel (${{ matrix.os }})
+    needs: verify_version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+
+      - name: Install FFmpeg dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew update && brew install pkg-config ffmpeg
+
+      - name: Install FFmpeg dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP\vcpkg"
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install ffmpeg:x64-windows
+          "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin
+        run: python -m pip install --upgrade pip maturin
+
+      - name: Build wheel
+        run: maturin build -b pyo3 --release --features python --compatibility off --out dist
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheel-${{ matrix.os }}
+          path: dist/*.whl
+
+  build_sdist:
+    name: Build source distribution
+    needs: verify_version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin
+        run: python -m pip install --upgrade pip maturin
+
+      - name: Build sdist
+        run: maturin sdist --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  publish_pypi:
+    name: Publish to PyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/scuisei-rs
+    permissions:
+      id-token: write
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  github_release:
+    name: Create GitHub release
+    needs: [verify_version, build_wheels, build_sdist, publish_pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: scuisei-rs ${{ needs.verify_version.outputs.version }}
+          generate_release_notes: true
+          files: dist/*

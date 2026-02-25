@@ -1,0 +1,122 @@
+#![deny(clippy::pedantic)]
+
+pub mod analysis;
+pub mod cli;
+mod decoder;
+pub mod detector;
+pub mod error;
+mod formatter;
+mod postprocess;
+pub mod simd_metrics;
+
+#[cfg(feature = "python")]
+mod python;
+
+pub use analysis::{AnalysisResult, AnalyzeOptions, analyze_video};
+pub use detector::{DetectorConfig, XvidDetectorConfig};
+pub use error::{SCuiseiError, SCuiseiResult};
+use std::io::Write;
+use std::path::PathBuf;
+
+fn build_xvid_config(cli: &cli::Cli) -> detector::XvidDetectorConfig {
+    detector::XvidDetectorConfig {
+        search_radius: cli.me_search_radius,
+        intra_thresh: cli.me_intra_thresh,
+        intra_thresh2: cli.me_intra_thresh2,
+    }
+}
+
+fn build_adaptive_config(cli: &cli::Cli) -> detector::DetectorConfig {
+    detector::DetectorConfig {
+        window_size: cli.window_size,
+        sigma: cli.sigma,
+        base_threshold: cli.base_threshold,
+        min_hist_distance: cli.min_hist_distance,
+        min_score: cli.min_score,
+        sad_weight: cli.sad_weight,
+        hist_weight: cli.hist_weight,
+    }
+}
+
+impl AnalyzeOptions {
+    #[must_use]
+    pub fn from_cli(cli: &cli::Cli, dump_scores: bool) -> Self {
+        Self {
+            input: cli.input.clone(),
+            native_res: cli.native_res,
+            hwdec: cli.hwdec.clone(),
+            dump_scores,
+            xvid_config: build_xvid_config(cli),
+            adaptive_config: build_adaptive_config(cli),
+        }
+    }
+
+    #[must_use]
+    pub fn defaults_for_input(input: impl Into<PathBuf>) -> Self {
+        Self {
+            input: input.into(),
+            native_res: false,
+            hwdec: None,
+            dump_scores: false,
+            xvid_config: detector::XvidDetectorConfig::default(),
+            adaptive_config: detector::DetectorConfig::default(),
+        }
+    }
+}
+
+/// Write comma-separated keyframe indices and a trailing newline.
+///
+/// # Errors
+/// Returns an error if writing to the output stream fails.
+pub fn write_frames_csv<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuiseiResult<()> {
+    for (index, frame) in keyframes.iter().enumerate() {
+        if index > 0 {
+            write!(writer, ",")
+                .map_err(|error| SCuiseiError::io("failed to write frame separator", &error))?;
+        }
+        write!(writer, "{frame}")
+            .map_err(|error| SCuiseiError::io("failed to write frame index", &error))?;
+    }
+    writeln!(writer)
+        .map_err(|error| SCuiseiError::io("failed to write trailing newline", &error))?;
+    Ok(())
+}
+
+/// Write SCXvid-compatible frame decisions (`i`/`p`) to a writer.
+///
+/// # Errors
+/// Returns an error if writing to the output stream fails.
+pub fn write_pass_log<W: Write>(writer: &mut W, pass_decisions: &[bool]) -> SCuiseiResult<()> {
+    let mut pass_formatter =
+        formatter::ScxvidPassFormatter::new(writer).map_err(SCuiseiError::from)?;
+    for (index, is_cut) in pass_decisions.iter().copied().enumerate() {
+        if index == 0 {
+            pass_formatter
+                .write_first_frame()
+                .map_err(SCuiseiError::from)?;
+            continue;
+        }
+        pass_formatter
+            .write_frame(is_cut)
+            .map_err(SCuiseiError::from)?;
+    }
+    Ok(())
+}
+
+/// Run the CLI command using the shared library pipeline.
+///
+/// # Errors
+/// Returns an error if analysis fails or writing formatted output fails.
+pub fn run_cli<W: Write>(cli: &cli::Cli, writer: &mut W) -> SCuiseiResult<()> {
+    let dump_scores = std::env::var_os("SCUISEI_DUMP_SCORES").is_some();
+    let options = AnalyzeOptions::from_cli(cli, dump_scores);
+    let result = analyze_video(&options)?;
+
+    if cli.frames {
+        write_frames_csv(writer, &result.keyframes)?;
+    } else {
+        write_pass_log(writer, &result.pass_decisions)?;
+    }
+
+    Ok(())
+}
