@@ -47,7 +47,7 @@ jobs:
           fi
 
   build_wheels:
-    name: Build wheel (${{ matrix.os }})
+    name: Build wheel and binary (${{ matrix.os }})
     needs: verify_version
     runs-on: ${{ matrix.os }}
     strategy:
@@ -65,14 +65,25 @@ jobs:
         if: runner.os == 'macOS'
         run: brew update && brew install pkg-config ffmpeg
 
+      - name: Restore vcpkg binary cache (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\vcpkg-binary-cache
+          key: vcpkg-${{ runner.os }}-ffmpeg-x64-windows-v1
+
       - name: Install FFmpeg dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $binaryCache = "$env:RUNNER_TEMP\vcpkg-binary-cache"
+          New-Item -ItemType Directory -Force -Path $binaryCache | Out-Null
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
           git clone https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP\vcpkg"
           & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
           & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install ffmpeg:x64-windows
           "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_BINARY_SOURCES=$env:VCPKG_BINARY_SOURCES" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Set up Rust
@@ -89,13 +100,41 @@ jobs:
         run: python -m pip install --upgrade pip maturin
 
       - name: Build wheel
-        run: maturin build -b pyo3 --release --features python --compatibility off --out dist
+        run: maturin build -b pyo3 --release --features python --out dist
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
           name: dist-wheel-${{ matrix.os }}
           path: dist/*.whl
+
+      - name: Build CLI binary
+        run: cargo build --release --bin scuisei-rs
+
+      - name: Package CLI binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          os="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
+          arch="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
+          tar -C target/release -czf "dist/scuisei-rs-${os}-${arch}.tar.gz" scuisei-rs
+
+      - name: Package CLI binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $os = $env:RUNNER_OS.ToLowerInvariant()
+          $arch = $env:RUNNER_ARCH.ToLowerInvariant()
+          Compress-Archive -Path target/release/scuisei-rs.exe -DestinationPath "dist/scuisei-rs-$os-$arch.zip" -Force
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.os }}
+          path: dist/scuisei-rs-*
 
   build_sdist:
     name: Build source distribution
@@ -154,6 +193,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
           path: dist
           merge-multiple: true
 
