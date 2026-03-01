@@ -34,6 +34,9 @@ jobs:
         run: |
           $archive = "$env:RUNNER_TEMP\ffmpeg-release-full-shared.7z"
           $extractRoot = "$env:RUNNER_TEMP\ffmpeg"
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            choco install 7zip --no-progress -y
+          }
           Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile $archive
           New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
           & 7z x $archive "-o$extractRoot" -y | Out-Null
@@ -101,6 +104,9 @@ jobs:
         run: |
           $archive = "$env:RUNNER_TEMP\ffmpeg-release-full-shared.7z"
           $extractRoot = "$env:RUNNER_TEMP\ffmpeg"
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            choco install 7zip --no-progress -y
+          }
           Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile $archive
           New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
           & 7z x $archive "-o$extractRoot" -y | Out-Null
