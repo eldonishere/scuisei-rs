@@ -25,6 +25,7 @@ crate-type = ["rlib"]
 [features]
 default = []
 python = ["dep:pyo3"]
+ffmpeg-build = ["ffmpeg-next/build"]
 
 [dependencies]
 ffmpeg-next = { version = "=8.0.0", default-features = false, features = ["codec", "format", "software-scaling"] }

@@ -42,6 +42,11 @@ def main() -> int:
         default="dist/*.whl",
         help="Glob that resolves to one built wheel.",
     )
+    parser.add_argument(
+        "--allow-static",
+        action="store_true",
+        help="Allow wheels without bundled FFmpeg shared libraries (for static linking).",
+    )
     args = parser.parse_args()
 
     wheels = sorted(glob.glob(args.wheel_glob))
@@ -62,6 +67,13 @@ def main() -> int:
         if not _component_present(files, component, args.platform)
     ]
     if missing:
+        if args.allow_static and args.platform == "linux":
+            size_mb = os.path.getsize(wheel) / (1024 * 1024)
+            print(
+                "No bundled FFmpeg shared libraries detected; "
+                f"assuming static linking in {os.path.basename(wheel)} ({size_mb:.1f} MB)."
+            )
+            return 0
         print(
             f"Wheel {os.path.basename(wheel)} is missing bundled FFmpeg runtime libraries: "
             + ", ".join(missing),

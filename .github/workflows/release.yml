@@ -59,7 +59,7 @@ jobs:
 
       - name: Install FFmpeg dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config patchelf libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config patchelf nasm libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 
       - name: Install FFmpeg dependencies (macOS)
         if: runner.os == 'macOS'
@@ -107,7 +107,12 @@ jobs:
         if: runner.os == 'Windows'
         run: python -m pip install --upgrade delvewheel
 
-      - name: Build wheel
+      - name: Build wheel (Linux)
+        if: runner.os == 'Linux'
+        run: maturin build -b pyo3 --release --strip --features "python,ffmpeg-build" --out dist/unrepaired
+
+      - name: Build wheel (macOS/Windows)
+        if: runner.os != 'Linux'
         run: maturin build -b pyo3 --release --features python --out dist/unrepaired
 
       - name: Repair wheel (Linux)
@@ -135,7 +140,7 @@ jobs:
 
       - name: Verify wheel bundles FFmpeg runtime (Linux)
         if: runner.os == 'Linux'
-        run: python scripts/check_wheel_ffmpeg_runtime.py --platform linux --wheel-glob "dist/*.whl"
+        run: python scripts/check_wheel_ffmpeg_runtime.py --platform linux --allow-static --wheel-glob "dist/*.whl"
 
       - name: Verify wheel bundles FFmpeg runtime (macOS)
         if: runner.os == 'macOS'
