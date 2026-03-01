@@ -22,32 +22,30 @@ jobs:
 
       - name: Install FFmpeg dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config patchelf nasm libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 
       - name: Install FFmpeg dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew update && brew install pkg-config ffmpeg
 
-      - name: Restore vcpkg binary cache (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}\vcpkg-binary-cache
-          key: vcpkg-${{ runner.os }}-ffmpeg-x64-windows-v1
-
       - name: Install FFmpeg dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $binaryCache = "$env:RUNNER_TEMP\vcpkg-binary-cache"
-          New-Item -ItemType Directory -Force -Path $binaryCache | Out-Null
-          $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
-          git clone https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP\vcpkg"
-          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
-          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install ffmpeg:x64-windows
-          "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKG_BINARY_SOURCES=$env:VCPKG_BINARY_SOURCES" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $archive = "$env:RUNNER_TEMP\ffmpeg-release-full-shared.7z"
+          $extractRoot = "$env:RUNNER_TEMP\ffmpeg"
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            choco install 7zip --no-progress -y
+          }
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile $archive
+          New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+          & 7z x $archive "-o$extractRoot" -y | Out-Null
+          $ffmpegDir = Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1
+          if (-not $ffmpegDir) {
+            throw "Failed to locate extracted FFmpeg directory"
+          }
+          "FFMPEG_DIR=$($ffmpegDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($ffmpegDir.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -87,14 +85,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install FFmpeg dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config patchelf nasm libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+
+      - name: Install FFmpeg dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew update && brew install pkg-config ffmpeg
+
+      - name: Install FFmpeg dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "$env:RUNNER_TEMP\ffmpeg-release-full-shared.7z"
+          $extractRoot = "$env:RUNNER_TEMP\ffmpeg"
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            choco install 7zip --no-progress -y
+          }
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile $archive
+          New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+          & 7z x $archive "-o$extractRoot" -y | Out-Null
+          $ffmpegDir = Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1
+          if (-not $ffmpegDir) {
+            throw "Failed to locate extracted FFmpeg directory"
+          }
+          "FFMPEG_DIR=$($ffmpegDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($ffmpegDir.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -109,11 +130,70 @@ jobs:
       - name: Install Python build tooling
         run: python -m pip install --upgrade pip maturin
 
-      - name: Build wheel artifacts
-        run: maturin build -b pyo3 --release --features python --compatibility off --out dist
+      - name: Install macOS wheel repair tooling
+        if: runner.os == 'macOS'
+        run: python -m pip install --upgrade delocate
 
-      - name: Install built wheel
+      - name: Install Windows wheel repair tooling
+        if: runner.os == 'Windows'
+        run: python -m pip install --upgrade delvewheel
+
+      - name: Build wheel artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: maturin build -b pyo3 --release --strip --features "python,ffmpeg-build" --out dist/unrepaired
+
+      - name: Build wheel artifacts (macOS/Windows)
+        if: runner.os != 'Linux'
+        run: maturin build -b pyo3 --release --features python --out dist/unrepaired
+
+      - name: Repair wheel (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp dist/unrepaired/*.whl dist/
+
+      - name: Repair wheel (macOS)
+        if: runner.os == 'macOS'
+        run: python -m delocate.cmd.delocate_wheel --wheel-dir dist dist/unrepaired/*.whl
+
+      - name: Repair wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem dist\unrepaired\*.whl | Select-Object -First 1
+          if (-not $wheel) {
+            throw "No wheel found in dist/unrepaired"
+          }
+          $ffmpegBin = "$env:FFMPEG_DIR\bin"
+          python -m delvewheel repair --add-path $ffmpegBin -w dist $wheel.FullName
+
+      - name: Verify wheel bundles FFmpeg runtime (Linux)
+        if: runner.os == 'Linux'
+        run: python scripts/check_wheel_ffmpeg_runtime.py --platform linux --allow-static --wheel-glob "dist/*.whl"
+
+      - name: Verify wheel bundles FFmpeg runtime (macOS)
+        if: runner.os == 'macOS'
+        run: python scripts/check_wheel_ffmpeg_runtime.py --platform macos --wheel-glob "dist/*.whl"
+
+      - name: Verify wheel bundles FFmpeg runtime (Windows)
+        if: runner.os == 'Windows'
+        run: python scripts/check_wheel_ffmpeg_runtime.py --platform windows --wheel-glob "dist/*.whl"
+
+      - name: Install built wheel (Linux/macOS)
+        if: runner.os != 'Windows'
         run: python -m pip install --force-reinstall dist/*.whl
+
+      - name: Install built wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem dist\*.whl | Select-Object -First 1
+          if (-not $wheel) {
+            throw "No repaired wheel found in dist"
+          }
+          python -m pip install --force-reinstall $wheel.FullName
 
       - name: Run Python integration smoke test
         run: python scripts/python_integration_smoke.py

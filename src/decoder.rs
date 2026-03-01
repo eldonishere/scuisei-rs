@@ -83,6 +83,14 @@ fn enable_hwdec(
     anyhow::bail!("failed to enable hardware decoding")
 }
 
+fn configure_decoder_threading(ctx: &mut ffmpeg::codec::context::Context) {
+    // Enable FFmpeg's built-in frame threading for software decode.
+    // count=0 lets FFmpeg auto-pick an appropriate worker count.
+    let mut config = ffmpeg::codec::threading::Config::kind(ffmpeg::codec::threading::Type::Frame);
+    config.count = 0;
+    ctx.set_threading(config);
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FrameInfo {
     pub width: usize,
@@ -139,6 +147,7 @@ impl Decoder {
                 .context("failed to create decoder context")?;
         let codec = ffmpeg::codec::decoder::find(context_decoder.id())
             .context("failed to find video decoder")?;
+        configure_decoder_threading(&mut context_decoder);
         let hw = hwdev
             .map(|name| {
                 let ty = parse_hw_device_type(name)?;

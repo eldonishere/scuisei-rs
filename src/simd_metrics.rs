@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use wide::{u8x16, u16x8, u32x8};
 
 pub const GRID_HIST_X: usize = 4;
@@ -235,6 +236,7 @@ const DEV_STATIC: u32 = 1000;
 const SAD_STATIC: u32 = 1000;
 const DEV_BIAS: u32 = 512;
 const DEV_HALF: u32 = 3000;
+const PARALLEL_SUPERBLOCK_THRESHOLD: usize = 24;
 const TWO_POW_32_F64: f64 = 4_294_967_296.0;
 
 #[derive(Clone, Copy, Debug)]
@@ -392,6 +394,65 @@ fn empty_me_analysis() -> MeAnalysis {
         total_blocks: 0,
         mc_sad: 0,
     }
+}
+
+fn superblock_budget(superblock_count: usize) -> u64 {
+    let count_u64 = u64::try_from(superblock_count).unwrap_or(u64::MAX);
+    10_u64.saturating_add(10_u64.saturating_mul(count_u64))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SuperblockEvalContext<'a> {
+    prev: &'a [u8],
+    curr: &'a [u8],
+    width: usize,
+    search_radius: i32,
+    intra_thresh_u32: u32,
+    max_horizontal_limit: usize,
+    max_vertical_limit: usize,
+}
+
+fn analyze_superblock_row(
+    context: &SuperblockEvalContext<'_>,
+    x_indices: &[usize],
+    macroblock_y: usize,
+) -> (usize, u64, u64) {
+    let base_y = macroblock_y.saturating_mul(BLOCK_EDGE);
+    let mut row_intra = 0_usize;
+    let mut row_ssad = 0_u64;
+    let mut row_complexity = 0_u64;
+
+    for macroblock_x in x_indices.iter().copied() {
+        let base_x = macroblock_x.saturating_mul(BLOCK_EDGE);
+        let search_window = superblock_search_window(
+            base_x,
+            base_y,
+            context.search_radius,
+            context.max_horizontal_limit,
+            context.max_vertical_limit,
+        );
+        let search_results = search_superblock_matches(
+            context.prev,
+            context.curr,
+            context.width,
+            base_x,
+            base_y,
+            search_window,
+        );
+        let (intra_delta, ssad_delta, complexity_delta) = accumulate_superblock_metrics(
+            context.curr,
+            context.width,
+            base_x,
+            base_y,
+            context.intra_thresh_u32,
+            search_results,
+        );
+        row_intra = row_intra.saturating_add(intra_delta);
+        row_ssad = row_ssad.saturating_add(ssad_delta);
+        row_complexity = row_complexity.saturating_add(complexity_delta);
+    }
+
+    (row_intra, row_ssad, row_complexity)
 }
 
 fn superblock_search_window(
@@ -674,40 +735,50 @@ pub fn meanalysis_xvid_like(
         return empty_me_analysis();
     }
 
-    let mut intra_blocks = 0_usize;
-    let mut ssad = 0_u64;
-    let mut complexity = 0_u64;
-    let mut blocks = 10_u64;
-    let max_horizontal_limit = width.saturating_sub(32);
-    let max_vertical_limit = height.saturating_sub(32);
+    let superblock_count = x_indices.len().saturating_mul(y_indices.len());
+    let blocks = superblock_budget(superblock_count);
+    let context = SuperblockEvalContext {
+        prev,
+        curr,
+        width,
+        search_radius,
+        intra_thresh_u32,
+        max_horizontal_limit: width.saturating_sub(32),
+        max_vertical_limit: height.saturating_sub(32),
+    };
+    let should_parallelize = superblock_count >= PARALLEL_SUPERBLOCK_THRESHOLD
+        && std::thread::available_parallelism().is_ok_and(|workers| workers.get() > 1);
 
-    for macroblock_y in y_indices {
-        let base_y = macroblock_y.saturating_mul(BLOCK_EDGE);
-        for macroblock_x in x_indices.iter().copied() {
-            let base_x = macroblock_x.saturating_mul(BLOCK_EDGE);
-            blocks = blocks.saturating_add(10);
-            let search_window = superblock_search_window(
-                base_x,
-                base_y,
-                search_radius,
-                max_horizontal_limit,
-                max_vertical_limit,
-            );
-            let search_results =
-                search_superblock_matches(prev, curr, width, base_x, base_y, search_window);
-            let (intra_delta, ssad_delta, complexity_delta) = accumulate_superblock_metrics(
-                curr,
-                width,
-                base_x,
-                base_y,
-                intra_thresh_u32,
-                search_results,
-            );
-            intra_blocks = intra_blocks.saturating_add(intra_delta);
-            ssad = ssad.saturating_add(ssad_delta);
-            complexity = complexity.saturating_add(complexity_delta);
+    let (intra_blocks, ssad, complexity) = if should_parallelize {
+        y_indices
+            .par_iter()
+            .copied()
+            .map(|macroblock_y| analyze_superblock_row(&context, &x_indices, macroblock_y))
+            .reduce(
+                || (0_usize, 0_u64, 0_u64),
+                |left, right| {
+                    (
+                        left.0.saturating_add(right.0),
+                        left.1.saturating_add(right.1),
+                        left.2.saturating_add(right.2),
+                    )
+                },
+            )
+    } else {
+        let mut intra_blocks = 0_usize;
+        let mut ssad = 0_u64;
+        let mut complexity = 0_u64;
+
+        for macroblock_y in y_indices {
+            let (row_intra, row_ssad, row_complexity) =
+                analyze_superblock_row(&context, &x_indices, macroblock_y);
+            intra_blocks = intra_blocks.saturating_add(row_intra);
+            ssad = ssad.saturating_add(row_ssad);
+            complexity = complexity.saturating_add(row_complexity);
         }
-    }
+
+        (intra_blocks, ssad, complexity)
+    };
 
     let complexity_scaled = complexity >> 7;
     let denom = complexity_scaled.saturating_add(4_u64.saturating_mul(blocks));
