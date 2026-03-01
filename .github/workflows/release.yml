@@ -65,26 +65,21 @@ jobs:
         if: runner.os == 'macOS'
         run: brew update && brew install pkg-config ffmpeg
 
-      - name: Restore vcpkg binary cache (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}\vcpkg-binary-cache
-          key: vcpkg-${{ runner.os }}-ffmpeg-x64-windows-v1
-
       - name: Install FFmpeg dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $binaryCache = "$env:RUNNER_TEMP\vcpkg-binary-cache"
-          New-Item -ItemType Directory -Force -Path $binaryCache | Out-Null
-          $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
-          git clone https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP\vcpkg"
-          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
-          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install ffmpeg:x64-windows
-          "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKG_BINARY_SOURCES=$env:VCPKG_BINARY_SOURCES" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $archive = "$env:RUNNER_TEMP\ffmpeg-release-full-shared.7z"
+          $extractRoot = "$env:RUNNER_TEMP\ffmpeg"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile $archive
+          New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+          & 7z x $archive "-o$extractRoot" -y | Out-Null
+          $ffmpegDir = Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1
+          if (-not $ffmpegDir) {
+            throw "Failed to locate extracted FFmpeg directory"
+          }
+          "FFMPEG_DIR=$($ffmpegDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($ffmpegDir.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -135,7 +130,7 @@ jobs:
           if (-not $wheel) {
             throw "No wheel found in dist/unrepaired"
           }
-          $ffmpegBin = "$env:VCPKG_ROOT\installed\x64-windows\bin"
+          $ffmpegBin = "$env:FFMPEG_DIR\bin"
           python -m delvewheel repair --add-path $ffmpegBin -w dist $wheel.FullName
 
       - name: Verify wheel bundles FFmpeg runtime (Linux)
