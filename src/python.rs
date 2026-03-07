@@ -1,4 +1,7 @@
-use crate::{AnalyzeOptions, PostprocessConfig, SCuiseiError, analyze_video, write_pass_log};
+use crate::{
+    AnalyzeOptions, PostprocessConfig, SCuiseiError, analyze_keyframes, analyze_pass_decisions,
+    write_pass_log,
+};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -161,9 +164,7 @@ fn detect_frames(
     options.native_res = native_res;
     options.hwdec = hwdec;
     apply_postprocess_config(py, &mut options, postprocess);
-    analyze_video(&options)
-        .map(|result| result.keyframes)
-        .map_err(|error| to_py_err(&error))
+    analyze_keyframes(&options).map_err(|error| to_py_err(&error))
 }
 
 #[pyfunction]
@@ -180,9 +181,9 @@ fn detect_pass(
     options.hwdec = hwdec;
     apply_postprocess_config(py, &mut options, postprocess);
 
-    let result = analyze_video(&options).map_err(|error| to_py_err(&error))?;
+    let pass_decisions = analyze_pass_decisions(&options).map_err(|error| to_py_err(&error))?;
     let mut pass_bytes: Vec<u8> = Vec::new();
-    write_pass_log(&mut pass_bytes, &result.pass_decisions).map_err(|error| to_py_err(&error))?;
+    write_pass_log(&mut pass_bytes, &pass_decisions).map_err(|error| to_py_err(&error))?;
     String::from_utf8(pass_bytes).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 

@@ -2,7 +2,8 @@ mod common;
 
 use assert_cmd::Command;
 use scuisei_rs::{
-    AnalyzeOptions, SCuiseiError, analyze_video, write_agi, write_frames_csv, write_pass_log,
+    AnalyzeOptions, SCuiseiError, analyze_keyframes, analyze_pass_decisions, analyze_video,
+    write_agi, write_frames_csv, write_pass_log,
 };
 use std::fs;
 use std::path::Path;
@@ -104,4 +105,19 @@ fn test_library_api_rejects_invalid_config_as_config_error() {
     options.adaptive_config.hist_weight = 0.0;
     let error = analyze_video(&options).expect_err("zero detector weights should fail");
     assert!(matches!(error, SCuiseiError::Config(_)));
+}
+
+#[test]
+fn test_specialized_analysis_paths_match_full_analysis() {
+    let fixture_path = Path::new("target/fixtures/test_video.y4m");
+    common::ensure_fixture_y4m(fixture_path);
+
+    let options = AnalyzeOptions::defaults_for_input(fixture_path);
+    let full = analyze_video(&options).expect("full analysis should succeed");
+    let keyframes = analyze_keyframes(&options).expect("keyframe analysis should succeed");
+    let pass_decisions =
+        analyze_pass_decisions(&options).expect("pass-decision analysis should succeed");
+
+    assert_eq!(keyframes, full.keyframes);
+    assert_eq!(pass_decisions, full.pass_decisions);
 }

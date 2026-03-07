@@ -4,6 +4,23 @@ use std::path::PathBuf;
 
 const ADAPTIVE_PROMOTION_MIN_RATIO: f64 = 0.85;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnalysisTarget {
+    Keyframes,
+    PassDecisions,
+    Both,
+}
+
+impl AnalysisTarget {
+    fn needs_keyframes(self) -> bool {
+        matches!(self, Self::Keyframes | Self::Both)
+    }
+
+    fn needs_pass_decisions(self) -> bool {
+        matches!(self, Self::PassDecisions | Self::Both)
+    }
+}
+
 #[derive(Clone, Debug)]
 /// Parameters that control a full scene-detection run.
 pub struct AnalyzeOptions {
@@ -256,10 +273,32 @@ fn dump_score_line(frame_index: usize, record: DetectionRecord) {
 /// or frame processing encounters an I/O/codec error.
 pub fn analyze_video(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult> {
     options.validate()?;
-    analyze_video_impl(options)
+    analyze_video_impl(options, AnalysisTarget::Both)
 }
 
-fn analyze_video_impl(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult> {
+/// Analyze a video and return only refined keyframe indices.
+///
+/// # Errors
+/// Returns an error if analysis fails.
+pub fn analyze_keyframes(options: &AnalyzeOptions) -> SCuiseiResult<Vec<usize>> {
+    options.validate()?;
+    analyze_video_impl(options, AnalysisTarget::Keyframes).map(|result| result.keyframes)
+}
+
+/// Analyze a video and return only SCXvid-style pass decisions.
+///
+/// # Errors
+/// Returns an error if analysis fails.
+pub fn analyze_pass_decisions(options: &AnalyzeOptions) -> SCuiseiResult<Vec<bool>> {
+    options.xvid_config.validate()?;
+    options.adaptive_config.validate()?;
+    analyze_video_impl(options, AnalysisTarget::PassDecisions).map(|result| result.pass_decisions)
+}
+
+fn analyze_video_impl(
+    options: &AnalyzeOptions,
+    target: AnalysisTarget,
+) -> SCuiseiResult<AnalysisResult> {
     ffmpeg_next::init()
         .map_err(|error| SCuiseiError::decode_with("failed to initialize ffmpeg", &error))?;
 
@@ -267,8 +306,16 @@ fn analyze_video_impl(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult>
     let mut adaptive_detector = detector::Detector::new(options.adaptive_config);
     let mut state = DetectionState::new();
     let mut curr_small: Vec<u8> = Vec::new();
-    let mut frame_stats: Vec<postprocess::FrameCutStats> = Vec::new();
-    let mut pass_decisions: Vec<bool> = Vec::new();
+    let mut frame_stats: Vec<postprocess::FrameCutStats> = if target.needs_keyframes() {
+        Vec::new()
+    } else {
+        Vec::with_capacity(0)
+    };
+    let mut pass_decisions: Vec<bool> = if target.needs_pass_decisions() {
+        Vec::new()
+    } else {
+        Vec::with_capacity(0)
+    };
 
     decoder::Decoder::open(&options.input, options.hwdec.as_deref())?.decode_luma_frames(
         |curr_luma, info| {
@@ -277,7 +324,9 @@ fn analyze_video_impl(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult>
             let snapshot = current.snapshot;
 
             if state.is_first_frame() {
-                pass_decisions.push(true);
+                if target.needs_pass_decisions() {
+                    pass_decisions.push(true);
+                }
                 state.absorb(curr_luma, &mut curr_small, options.native_res, &snapshot);
                 return Ok(());
             }
@@ -287,23 +336,30 @@ fn analyze_video_impl(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult>
             if options.dump_scores {
                 dump_score_line(state.frame_index, record);
             }
-            pass_decisions.push(record.is_cut);
-            frame_stats.push(postprocess::FrameCutStats {
-                frame_index: state.frame_index,
-                is_cut: record.is_cut,
-                score: record.score,
-                hist_distance: record.hist_distance,
-                grid_hist_distance: record.grid_hist_distance,
-                grid_hist_median: record.grid_hist_median,
-            });
+            if target.needs_pass_decisions() {
+                pass_decisions.push(record.is_cut);
+            }
+            if target.needs_keyframes() {
+                frame_stats.push(postprocess::FrameCutStats {
+                    frame_index: state.frame_index,
+                    is_cut: record.is_cut,
+                    score: record.score,
+                    hist_distance: record.hist_distance,
+                    grid_hist_distance: record.grid_hist_distance,
+                    grid_hist_median: record.grid_hist_median,
+                });
+            }
 
             state.absorb(curr_luma, &mut curr_small, options.native_res, &snapshot);
             Ok(())
         },
     )?;
 
-    let keyframes =
-        postprocess::refine_frame_keyframes_with_config(&frame_stats, &options.postprocess_config);
+    let keyframes = if target.needs_keyframes() {
+        postprocess::refine_frame_keyframes_with_config(&frame_stats, &options.postprocess_config)
+    } else {
+        Vec::new()
+    };
     Ok(AnalysisResult {
         keyframes,
         pass_decisions,

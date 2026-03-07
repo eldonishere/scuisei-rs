@@ -14,7 +14,9 @@ mod validation;
 mod python;
 
 use crate::cli::OutputFormat;
-pub use analysis::{AnalysisResult, AnalyzeOptions, analyze_video};
+pub use analysis::{
+    AnalysisResult, AnalyzeOptions, analyze_keyframes, analyze_pass_decisions, analyze_video,
+};
 pub use detector::{DetectorConfig, XvidDetectorConfig};
 pub use error::{SCuiseiError, SCuiseiResult};
 pub use postprocess::PostprocessConfig;
@@ -144,12 +146,20 @@ pub fn write_pass_log<W: Write>(writer: &mut W, pass_decisions: &[bool]) -> SCui
 pub fn run_cli<W: Write>(cli: &cli::Cli, writer: &mut W) -> SCuiseiResult<()> {
     let dump_scores = std::env::var_os("SCUISEI_DUMP_SCORES").is_some();
     let options = AnalyzeOptions::from_cli(cli, dump_scores);
-    let result = analyze_video(&options)?;
 
     match cli.format {
-        OutputFormat::Agi => write_agi(writer, &result.keyframes)?,
-        OutputFormat::Xvid => write_pass_log(writer, &result.pass_decisions)?,
-        OutputFormat::Frames => write_frames_csv(writer, &result.keyframes)?,
+        OutputFormat::Agi => {
+            let keyframes = analyze_keyframes(&options)?;
+            write_agi(writer, &keyframes)?;
+        }
+        OutputFormat::Xvid => {
+            let pass_decisions = analyze_pass_decisions(&options)?;
+            write_pass_log(writer, &pass_decisions)?;
+        }
+        OutputFormat::Frames => {
+            let keyframes = analyze_keyframes(&options)?;
+            write_frames_csv(writer, &keyframes)?;
+        }
     }
 
     Ok(())
