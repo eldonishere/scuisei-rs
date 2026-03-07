@@ -1,3 +1,8 @@
+use crate::validation::{
+    validate_finite_nonnegative, validate_nonnegative_i32, validate_positive_usize,
+    validate_unit_interval,
+};
+use crate::{SCuiseiError, SCuiseiResult};
 use std::collections::VecDeque;
 
 const MIN_SAMPLES_FOR_ADAPTIVE_THRESHOLD: usize = 5;
@@ -17,6 +22,17 @@ impl Default for XvidDetectorConfig {
             intra_thresh: crate::cli::DEFAULT_ME_INTRA_THRESH,
             intra_thresh2: crate::cli::DEFAULT_ME_INTRA_THRESH2,
         }
+    }
+}
+
+impl XvidDetectorConfig {
+    /// # Errors
+    /// Returns `SCuiseiError::Config` if any field is out of range.
+    pub fn validate(&self) -> SCuiseiResult<()> {
+        validate_nonnegative_i32("xvid_config.search_radius", self.search_radius)?;
+        validate_nonnegative_i32("xvid_config.intra_thresh", self.intra_thresh)?;
+        validate_finite_nonnegative("xvid_config.intra_thresh2", self.intra_thresh2)?;
+        Ok(())
     }
 }
 
@@ -128,6 +144,26 @@ impl Default for DetectorConfig {
             sad_weight: crate::cli::DEFAULT_SAD_WEIGHT,
             hist_weight: crate::cli::DEFAULT_HIST_WEIGHT,
         }
+    }
+}
+
+impl DetectorConfig {
+    /// # Errors
+    /// Returns `SCuiseiError::Config` if any field is out of range.
+    pub fn validate(&self) -> SCuiseiResult<()> {
+        validate_positive_usize("adaptive_config.window_size", self.window_size)?;
+        validate_finite_nonnegative("adaptive_config.sigma", self.sigma)?;
+        validate_unit_interval("adaptive_config.base_threshold", self.base_threshold)?;
+        validate_unit_interval("adaptive_config.min_hist_distance", self.min_hist_distance)?;
+        validate_unit_interval("adaptive_config.min_score", self.min_score)?;
+        validate_finite_nonnegative("adaptive_config.sad_weight", self.sad_weight)?;
+        validate_finite_nonnegative("adaptive_config.hist_weight", self.hist_weight)?;
+        if (self.sad_weight + self.hist_weight) <= f64::EPSILON {
+            return Err(SCuiseiError::config(
+                "adaptive_config.sad_weight + adaptive_config.hist_weight must be greater than 0",
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -88,3 +88,20 @@ fn test_library_api_classifies_missing_input_as_io_error() {
     let error = analyze_video(&options).expect_err("missing input should fail");
     assert!(matches!(error, SCuiseiError::Io(_)));
 }
+
+#[test]
+fn test_library_api_rejects_invalid_config_as_config_error() {
+    let fixture_path = Path::new("target/fixtures/test_video.y4m");
+    common::ensure_fixture_y4m(fixture_path);
+
+    let mut options = AnalyzeOptions::defaults_for_input(fixture_path);
+    options.adaptive_config.window_size = 0;
+    let error = analyze_video(&options).expect_err("invalid config should fail");
+    assert!(matches!(error, SCuiseiError::Config(_)));
+
+    options.adaptive_config.window_size = 30;
+    options.adaptive_config.sad_weight = 0.0;
+    options.adaptive_config.hist_weight = 0.0;
+    let error = analyze_video(&options).expect_err("zero detector weights should fail");
+    assert!(matches!(error, SCuiseiError::Config(_)));
+}

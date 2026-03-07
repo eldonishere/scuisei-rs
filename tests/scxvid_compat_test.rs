@@ -97,3 +97,37 @@ fn test_invalid_hwdec_fails_with_context() {
 
     cmd.assert().failure().stderr(contains("unknown --hwdec"));
 }
+
+#[test]
+fn test_invalid_window_size_is_rejected_by_cli() {
+    let fixture_path = Path::new("target/fixtures/test_video.y4m");
+    common::ensure_fixture_y4m(fixture_path);
+
+    let mut cmd = Command::cargo_bin("scuisei-rs").unwrap();
+    cmd.arg("-i")
+        .arg(fixture_path)
+        .arg("--window-size")
+        .arg("0");
+
+    cmd.assert()
+        .failure()
+        .stderr(contains("must be greater than 0"));
+}
+
+#[test]
+fn test_zero_detector_weights_fail_with_config_error() {
+    let fixture_path = Path::new("target/fixtures/test_video.y4m");
+    common::ensure_fixture_y4m(fixture_path);
+
+    let mut cmd = Command::cargo_bin("scuisei-rs").unwrap();
+    cmd.arg("-i")
+        .arg(fixture_path)
+        .arg("--sad-weight")
+        .arg("0")
+        .arg("--hist-weight")
+        .arg("0");
+
+    cmd.assert().failure().stderr(contains(
+        "adaptive_config.sad_weight + adaptive_config.hist_weight must be greater than 0",
+    ));
+}

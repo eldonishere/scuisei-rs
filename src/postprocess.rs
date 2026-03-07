@@ -1,3 +1,8 @@
+use crate::SCuiseiResult;
+use crate::validation::{
+    validate_finite_nonnegative, validate_positive_usize, validate_unit_interval,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PostprocessConfig {
     pub hist_blend_threshold: f64,
@@ -56,6 +61,75 @@ impl Default for PostprocessConfig {
             temporal_burst_cut_fallback_score_min: 120.0,
             grid_hist_median_weight: 0.1,
         }
+    }
+}
+
+impl PostprocessConfig {
+    /// # Errors
+    /// Returns `SCuiseiError::Config` if any field is out of range.
+    pub fn validate(&self) -> SCuiseiResult<()> {
+        validate_unit_interval(
+            "postprocess_config.hist_blend_threshold",
+            self.hist_blend_threshold,
+        )?;
+        validate_unit_interval(
+            "postprocess_config.structure_hist_max",
+            self.structure_hist_max,
+        )?;
+        validate_unit_interval(
+            "postprocess_config.structure_grid_hist_min",
+            self.structure_grid_hist_min,
+        )?;
+        validate_finite_nonnegative("postprocess_config.frames_score_min", self.frames_score_min)?;
+        validate_finite_nonnegative(
+            "postprocess_config.dense_recovery_blend_min",
+            self.dense_recovery_blend_min,
+        )?;
+        validate_finite_nonnegative(
+            "postprocess_config.dense_recovery_score_min",
+            self.dense_recovery_score_min,
+        )?;
+        validate_positive_usize(
+            "postprocess_config.dense_recovery_target_span_frames",
+            self.dense_recovery_target_span_frames,
+        )?;
+        validate_unit_interval(
+            "postprocess_config.temporal_burst_activity_blend_min",
+            self.temporal_burst_activity_blend_min,
+        )?;
+        validate_unit_interval(
+            "postprocess_config.temporal_burst_raw_hist_max",
+            self.temporal_burst_raw_hist_max,
+        )?;
+        validate_finite_nonnegative(
+            "postprocess_config.temporal_burst_raw_score_max",
+            self.temporal_burst_raw_score_max,
+        )?;
+        validate_finite_nonnegative(
+            "postprocess_config.temporal_burst_nonraw_score_max",
+            self.temporal_burst_nonraw_score_max,
+        )?;
+        validate_unit_interval(
+            "postprocess_config.temporal_burst_nonraw_blend_max",
+            self.temporal_burst_nonraw_blend_max,
+        )?;
+        validate_finite_nonnegative(
+            "postprocess_config.temporal_burst_dense_nonraw_score_max",
+            self.temporal_burst_dense_nonraw_score_max,
+        )?;
+        validate_unit_interval(
+            "postprocess_config.temporal_burst_cut_fallback_hist_max",
+            self.temporal_burst_cut_fallback_hist_max,
+        )?;
+        validate_finite_nonnegative(
+            "postprocess_config.temporal_burst_cut_fallback_score_min",
+            self.temporal_burst_cut_fallback_score_min,
+        )?;
+        validate_finite_nonnegative(
+            "postprocess_config.grid_hist_median_weight",
+            self.grid_hist_median_weight,
+        )?;
+        Ok(())
     }
 }
 

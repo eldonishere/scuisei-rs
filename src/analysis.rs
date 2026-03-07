@@ -255,6 +255,7 @@ fn dump_score_line(frame_index: usize, record: DetectionRecord) {
 /// Returns an error if `FFmpeg` initialization fails, the input cannot be decoded,
 /// or frame processing encounters an I/O/codec error.
 pub fn analyze_video(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult> {
+    options.validate()?;
     analyze_video_impl(options)
 }
 

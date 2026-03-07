@@ -8,6 +8,7 @@ pub mod error;
 mod formatter;
 mod postprocess;
 pub mod simd_metrics;
+mod validation;
 
 #[cfg(feature = "python")]
 mod python;
@@ -65,6 +66,17 @@ impl AnalyzeOptions {
             adaptive_config: detector::DetectorConfig::default(),
             postprocess_config: postprocess::PostprocessConfig::default(),
         }
+    }
+
+    /// Validate library-supplied configuration before analysis begins.
+    ///
+    /// # Errors
+    /// Returns `SCuiseiError::Config` if any option is out of range.
+    pub fn validate(&self) -> SCuiseiResult<()> {
+        self.xvid_config.validate()?;
+        self.adaptive_config.validate()?;
+        self.postprocess_config.validate()?;
+        Ok(())
     }
 }
 
