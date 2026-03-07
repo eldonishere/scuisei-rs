@@ -495,8 +495,19 @@ fn copy_luma_plane(frame: &Video, out: &mut Vec<u8>) -> AnyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hw_device_type, validate_hw_frame_requirement};
+    use super::{ScalerInput, parse_hw_device_type, scale_to_gray8, validate_hw_frame_requirement};
     use crate::SCuiseiError;
+    use ffmpeg_next::format::Pixel;
+    use ffmpeg_next::util::frame::video::Video;
+
+    fn make_video(format: Pixel, width: u32, height: u32) -> Video {
+        let mut frame = Video::new(format, width, height);
+        for plane in 0..frame.planes() {
+            let fill = if plane == 0 { 32_u8 } else { 128_u8 };
+            frame.data_mut(plane).fill(fill);
+        }
+        frame
+    }
 
     #[test]
     fn invalid_hwdec_name_is_config_error() {
@@ -521,5 +532,67 @@ mod tests {
     fn software_frames_are_allowed_without_hw_requirement() {
         assert!(validate_hw_frame_requirement(false, false).is_ok());
         assert!(validate_hw_frame_requirement(true, true).is_ok());
+    }
+
+    #[test]
+    fn scaler_recreates_on_format_change() {
+        ffmpeg_next::init().expect("ffmpeg init should succeed");
+
+        let mut scaler = None;
+        let mut scaler_input = None;
+        let mut gray = Video::empty();
+        let first = make_video(Pixel::YUV420P, 32, 32);
+        scale_to_gray8(&mut scaler, &mut scaler_input, &first, &mut gray)
+            .expect("first scale should succeed");
+        assert_eq!(
+            scaler_input,
+            Some(ScalerInput {
+                format: Pixel::YUV420P,
+                width: 32,
+                height: 32,
+            })
+        );
+
+        let second = make_video(Pixel::NV12, 32, 32);
+        scale_to_gray8(&mut scaler, &mut scaler_input, &second, &mut gray)
+            .expect("second scale should succeed");
+        assert_eq!(
+            scaler_input,
+            Some(ScalerInput {
+                format: Pixel::NV12,
+                width: 32,
+                height: 32,
+            })
+        );
+        assert_eq!(gray.format(), Pixel::GRAY8);
+        assert_eq!(gray.width(), 32);
+        assert_eq!(gray.height(), 32);
+    }
+
+    #[test]
+    fn scaler_recreates_on_dimension_change() {
+        ffmpeg_next::init().expect("ffmpeg init should succeed");
+
+        let mut scaler = None;
+        let mut scaler_input = None;
+        let mut gray = Video::empty();
+        let first = make_video(Pixel::YUV420P, 32, 32);
+        scale_to_gray8(&mut scaler, &mut scaler_input, &first, &mut gray)
+            .expect("first scale should succeed");
+
+        let second = make_video(Pixel::YUV420P, 64, 48);
+        scale_to_gray8(&mut scaler, &mut scaler_input, &second, &mut gray)
+            .expect("second scale should succeed");
+        assert_eq!(
+            scaler_input,
+            Some(ScalerInput {
+                format: Pixel::YUV420P,
+                width: 64,
+                height: 48,
+            })
+        );
+        assert_eq!(gray.format(), Pixel::GRAY8);
+        assert_eq!(gray.width(), 64);
+        assert_eq!(gray.height(), 48);
     }
 }

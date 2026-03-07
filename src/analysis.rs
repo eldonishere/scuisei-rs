@@ -1,6 +1,7 @@
 use crate::{SCuiseiError, SCuiseiResult};
 use crate::{decoder, detector, postprocess, simd_metrics};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 const ADAPTIVE_PROMOTION_MIN_RATIO: f64 = 0.85;
 
@@ -342,6 +343,17 @@ fn dump_score_line(frame_index: usize, record: DetectionRecord) {
     );
 }
 
+fn ensure_ffmpeg_initialized() -> SCuiseiResult<()> {
+    static FFMPEG_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    match FFMPEG_INIT.get_or_init(|| {
+        ffmpeg_next::init().map_err(|error| format!("failed to initialize ffmpeg: {error}"))
+    }) {
+        Ok(()) => Ok(()),
+        Err(message) => Err(SCuiseiError::decode(message.clone())),
+    }
+}
+
 /// Analyze a video and return both pass-frame decisions and refined keyframe indices.
 ///
 /// # Errors
@@ -375,8 +387,7 @@ fn analyze_video_impl(
     options: &AnalyzeOptions,
     target: AnalysisTarget,
 ) -> SCuiseiResult<AnalysisResult> {
-    ffmpeg_next::init()
-        .map_err(|error| SCuiseiError::decode_with("failed to initialize ffmpeg", &error))?;
+    ensure_ffmpeg_initialized()?;
 
     let mut xvid_detector = detector::XvidDetector::new(options.xvid_config);
     let mut adaptive_detector = detector::Detector::new(options.adaptive_config);
@@ -446,4 +457,15 @@ fn analyze_video_impl(
         keyframes,
         pass_decisions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_ffmpeg_initialized;
+
+    #[test]
+    fn ffmpeg_initialization_is_idempotent() {
+        assert!(ensure_ffmpeg_initialized().is_ok());
+        assert!(ensure_ffmpeg_initialized().is_ok());
+    }
 }
