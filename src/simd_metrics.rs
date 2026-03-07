@@ -1,4 +1,6 @@
 use rayon::prelude::*;
+use std::cell::RefCell;
+use std::sync::OnceLock;
 use wide::{u8x16, u16x8, u32x8};
 
 pub const GRID_HIST_X: usize = 4;
@@ -309,6 +311,24 @@ pub struct MeAnalysis {
     pub mc_sad: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MotionAnalysisPlan {
+    width: usize,
+    height: usize,
+    search_radius: i32,
+    total_blocks: usize,
+    blocks: u64,
+    x_indices: Vec<usize>,
+    y_indices: Vec<usize>,
+    should_parallelize: bool,
+    max_horizontal_limit: usize,
+    max_vertical_limit: usize,
+}
+
+thread_local! {
+    static MOTION_PLAN_CACHE: RefCell<Option<MotionAnalysisPlan>> = const { RefCell::new(None) };
+}
+
 const BLOCK_EDGE: usize = 16;
 const MIN_DEV: u32 = 300;
 const DEV_STATIC: u32 = 1000;
@@ -473,6 +493,12 @@ fn empty_me_analysis() -> MeAnalysis {
         total_blocks: 0,
         mc_sad: 0,
     }
+}
+
+fn available_workers() -> usize {
+    static AVAILABLE_WORKERS: OnceLock<usize> = OnceLock::new();
+    *AVAILABLE_WORKERS
+        .get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
 }
 
 fn superblock_budget(superblock_count: usize) -> u64 {
@@ -781,6 +807,123 @@ fn small_frame_meanalysis(
     }
 }
 
+fn build_motion_analysis_plan(
+    width: usize,
+    height: usize,
+    search_radius: i32,
+) -> Option<MotionAnalysisPlan> {
+    let mb_width = width.div_ceil(BLOCK_EDGE);
+    let mb_height = height.div_ceil(BLOCK_EDGE);
+    let interior_width = mb_width.saturating_sub(2);
+    let interior_height = mb_height.saturating_sub(2);
+    let total_blocks = interior_width.saturating_mul(interior_height);
+    if total_blocks == 0 {
+        return None;
+    }
+
+    let x_indices = superblock_indices(mb_width);
+    let y_indices = superblock_indices(mb_height);
+    if x_indices.is_empty() || y_indices.is_empty() {
+        return None;
+    }
+
+    let superblock_count = x_indices.len().saturating_mul(y_indices.len());
+
+    Some(MotionAnalysisPlan {
+        width,
+        height,
+        search_radius,
+        total_blocks,
+        blocks: superblock_budget(superblock_count),
+        should_parallelize: superblock_count >= PARALLEL_SUPERBLOCK_THRESHOLD
+            && available_workers() > 1,
+        x_indices,
+        y_indices,
+        max_horizontal_limit: width.saturating_sub(32),
+        max_vertical_limit: height.saturating_sub(32),
+    })
+}
+
+fn cached_motion_analysis_plan(
+    width: usize,
+    height: usize,
+    search_radius: i32,
+) -> Option<MotionAnalysisPlan> {
+    MOTION_PLAN_CACHE.with(|cache| {
+        let needs_refresh = cache.borrow().as_ref().is_none_or(|plan| {
+            plan.width != width || plan.height != height || plan.search_radius != search_radius
+        });
+        if needs_refresh {
+            *cache.borrow_mut() = build_motion_analysis_plan(width, height, search_radius);
+        }
+
+        cache.borrow().clone()
+    })
+}
+
+fn run_superblock_motion_analysis(
+    prev: &[u8],
+    curr: &[u8],
+    intra_thresh_u32: u32,
+    plan: &MotionAnalysisPlan,
+) -> MeAnalysis {
+    let context = SuperblockEvalContext {
+        prev,
+        curr,
+        width: plan.width,
+        search_radius: plan.search_radius,
+        intra_thresh_u32,
+        max_horizontal_limit: plan.max_horizontal_limit,
+        max_vertical_limit: plan.max_vertical_limit,
+    };
+
+    let (intra_blocks, ssad, complexity) = if plan.should_parallelize {
+        plan.y_indices
+            .par_iter()
+            .copied()
+            .map(|macroblock_y| analyze_superblock_row(&context, &plan.x_indices, macroblock_y))
+            .reduce(
+                || (0_usize, 0_u64, 0_u64),
+                |left, right| {
+                    (
+                        left.0.saturating_add(right.0),
+                        left.1.saturating_add(right.1),
+                        left.2.saturating_add(right.2),
+                    )
+                },
+            )
+    } else {
+        let mut intra_blocks = 0_usize;
+        let mut ssad = 0_u64;
+        let mut complexity = 0_u64;
+
+        for macroblock_y in plan.y_indices.iter().copied() {
+            let (row_intra, row_ssad, row_complexity) =
+                analyze_superblock_row(&context, &plan.x_indices, macroblock_y);
+            intra_blocks = intra_blocks.saturating_add(row_intra);
+            ssad = ssad.saturating_add(row_ssad);
+            complexity = complexity.saturating_add(row_complexity);
+        }
+
+        (intra_blocks, ssad, complexity)
+    };
+
+    let complexity_scaled = complexity >> 7;
+    let denom = complexity_scaled.saturating_add(4_u64.saturating_mul(plan.blocks));
+    let score = if denom == 0 {
+        0.0
+    } else {
+        u64_to_f64_exact(ssad / denom)
+    };
+
+    MeAnalysis {
+        score,
+        intra_blocks,
+        total_blocks: plan.total_blocks,
+        mc_sad: ssad,
+    }
+}
+
 #[must_use]
 pub fn meanalysis_xvid_like(
     prev: &[u8],
@@ -808,71 +951,11 @@ pub fn meanalysis_xvid_like(
         return small_frame_meanalysis(prev, curr, width, height, search_radius, intra_thresh_u32);
     }
 
-    let x_indices = superblock_indices(mb_width);
-    let y_indices = superblock_indices(mb_height);
-    if x_indices.is_empty() || y_indices.is_empty() {
+    let Some(plan) = cached_motion_analysis_plan(width, height, search_radius) else {
         return empty_me_analysis();
-    }
-
-    let superblock_count = x_indices.len().saturating_mul(y_indices.len());
-    let blocks = superblock_budget(superblock_count);
-    let context = SuperblockEvalContext {
-        prev,
-        curr,
-        width,
-        search_radius,
-        intra_thresh_u32,
-        max_horizontal_limit: width.saturating_sub(32),
-        max_vertical_limit: height.saturating_sub(32),
-    };
-    let should_parallelize = superblock_count >= PARALLEL_SUPERBLOCK_THRESHOLD
-        && std::thread::available_parallelism().is_ok_and(|workers| workers.get() > 1);
-
-    let (intra_blocks, ssad, complexity) = if should_parallelize {
-        y_indices
-            .par_iter()
-            .copied()
-            .map(|macroblock_y| analyze_superblock_row(&context, &x_indices, macroblock_y))
-            .reduce(
-                || (0_usize, 0_u64, 0_u64),
-                |left, right| {
-                    (
-                        left.0.saturating_add(right.0),
-                        left.1.saturating_add(right.1),
-                        left.2.saturating_add(right.2),
-                    )
-                },
-            )
-    } else {
-        let mut intra_blocks = 0_usize;
-        let mut ssad = 0_u64;
-        let mut complexity = 0_u64;
-
-        for macroblock_y in y_indices {
-            let (row_intra, row_ssad, row_complexity) =
-                analyze_superblock_row(&context, &x_indices, macroblock_y);
-            intra_blocks = intra_blocks.saturating_add(row_intra);
-            ssad = ssad.saturating_add(row_ssad);
-            complexity = complexity.saturating_add(row_complexity);
-        }
-
-        (intra_blocks, ssad, complexity)
     };
 
-    let complexity_scaled = complexity >> 7;
-    let denom = complexity_scaled.saturating_add(4_u64.saturating_mul(blocks));
-    let score = if denom == 0 {
-        0.0
-    } else {
-        u64_to_f64_exact(ssad / denom)
-    };
-
-    MeAnalysis {
-        score,
-        intra_blocks,
-        total_blocks,
-        mc_sad: ssad,
-    }
+    run_superblock_motion_analysis(prev, curr, intra_thresh_u32, &plan)
 }
 
 fn load_u8x16(bytes: &[u8]) -> u8x16 {
@@ -925,6 +1008,39 @@ mod tests {
         (0..len)
             .map(|idx| u8::try_from((idx + offset) % 256).unwrap_or(0))
             .collect()
+    }
+
+    fn meanalysis_xvid_like_fresh_plan(
+        prev: &[u8],
+        curr: &[u8],
+        width: usize,
+        height: usize,
+        search_radius: i32,
+        intra_thresh: i32,
+    ) -> MeAnalysis {
+        if width < 32 || height < 32 {
+            return empty_me_analysis();
+        }
+
+        let mb_width = width.div_ceil(BLOCK_EDGE);
+        let mb_height = height.div_ceil(BLOCK_EDGE);
+        let intra_thresh_u32 = u32::try_from(intra_thresh).unwrap_or(0);
+        if mb_width == 3 || mb_height == 3 {
+            return small_frame_meanalysis(
+                prev,
+                curr,
+                width,
+                height,
+                search_radius,
+                intra_thresh_u32,
+            );
+        }
+
+        let Some(plan) = build_motion_analysis_plan(width, height, search_radius) else {
+            return empty_me_analysis();
+        };
+
+        run_superblock_motion_analysis(prev, curr, intra_thresh_u32, &plan)
     }
 
     #[test]
@@ -1006,5 +1122,21 @@ mod tests {
         assert!(analysis.total_blocks > 0);
         assert!(analysis.intra_blocks <= analysis.total_blocks);
         assert!(analysis.score > 0.0 || analysis.intra_blocks > 0);
+    }
+
+    #[test]
+    fn meanalysis_cached_plan_matches_fresh_plan() {
+        let width: usize = 160;
+        let height: usize = 96;
+        let prev = make_frame(width * height, 7);
+        let curr = make_frame(width * height, 19);
+
+        let cached = meanalysis_xvid_like(&prev, &curr, width, height, 4, 2000);
+        let fresh = meanalysis_xvid_like_fresh_plan(&prev, &curr, width, height, 4, 2000);
+
+        assert_eq!(cached.total_blocks, fresh.total_blocks);
+        assert_eq!(cached.intra_blocks, fresh.intra_blocks);
+        assert_eq!(cached.mc_sad, fresh.mc_sad);
+        assert!((cached.score - fresh.score).abs() < f64::EPSILON);
     }
 }
