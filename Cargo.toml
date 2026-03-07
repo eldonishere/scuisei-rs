@@ -1,6 +1,6 @@
 [package]
 name = "scuisei-rs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.93"
 description = "Scene-change detection library and CLI"
