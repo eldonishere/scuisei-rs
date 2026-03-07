@@ -337,6 +337,17 @@ fn recover_dense_candidates(
     config: &PostprocessConfig,
 ) -> Vec<usize> {
     let mut recovered: Vec<usize> = Vec::new();
+    let mut interval_candidates: Vec<usize> = Vec::new();
+    let mut filtered: Vec<usize> = Vec::new();
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut slot_candidates: Vec<usize> = Vec::new();
+    let mut remaining: Vec<usize> = Vec::new();
+    let mut chosen_generation: Vec<u32> = vec![0; candidate_indices.len()];
+    let mut generation: u32 = 1;
+    let mut candidate_positions: Vec<usize> = vec![usize::MAX; stats.len()];
+    for (position, candidate_index) in candidate_indices.iter().copied().enumerate() {
+        candidate_positions[candidate_index] = position;
+    }
 
     for window in refined.windows(2) {
         let left = window[0];
@@ -346,28 +357,27 @@ fn recover_dense_candidates(
             continue;
         }
 
-        let interval_candidates: Vec<usize> = candidate_indices
-            .iter()
-            .copied()
-            .filter(|idx| {
-                let frame = stats[*idx].frame_index;
-                frame > left && frame < right
-            })
-            .collect();
+        interval_candidates.clear();
+        for idx in candidate_indices.iter().copied().filter(|idx| {
+            let frame = stats[*idx].frame_index;
+            frame > left && frame < right
+        }) {
+            interval_candidates.push(idx);
+        }
         if interval_candidates.len() < config.dense_recovery_min_candidates {
             continue;
         }
 
-        let filtered: Vec<usize> = interval_candidates
-            .into_iter()
-            .filter(|idx| {
-                let frame = stats[*idx].frame_index;
-                frame.saturating_sub(left) >= config.dense_recovery_margin_frames
-                    && right.saturating_sub(frame) >= config.dense_recovery_margin_frames
-                    && blended[*idx] >= config.dense_recovery_blend_min
-                    && stats[*idx].score >= config.dense_recovery_score_min
-            })
-            .collect();
+        filtered.clear();
+        for idx in interval_candidates.iter().copied().filter(|idx| {
+            let frame = stats[*idx].frame_index;
+            frame.saturating_sub(left) >= config.dense_recovery_margin_frames
+                && right.saturating_sub(frame) >= config.dense_recovery_margin_frames
+                && blended[*idx] >= config.dense_recovery_blend_min
+                && stats[*idx].score >= config.dense_recovery_score_min
+        }) {
+            filtered.push(idx);
+        }
         if filtered.is_empty() {
             continue;
         }
@@ -383,42 +393,49 @@ fn recover_dense_candidates(
         }
 
         let slots = max_additions + 1;
-        let mut chosen: Vec<usize> = Vec::new();
-        let mut chosen_mask = vec![false; stats.len()];
+        chosen.clear();
+        generation = generation.wrapping_add(1);
+        if generation == 0 {
+            chosen_generation.fill(0);
+            generation = 1;
+        }
         for slot in 0..max_additions {
             let start = left + (gap.saturating_mul(slot) / slots);
             let end = left + (gap.saturating_mul(slot + 1) / slots);
-            let slot_candidates: Vec<usize> = filtered
-                .iter()
-                .copied()
-                .filter(|idx| {
-                    let frame = stats[*idx].frame_index;
-                    frame >= start && frame <= end && !chosen_mask[*idx]
-                })
-                .collect();
+            slot_candidates.clear();
+            for idx in filtered.iter().copied().filter(|idx| {
+                let frame = stats[*idx].frame_index;
+                let position = candidate_positions[*idx];
+                frame >= start && frame <= end && chosen_generation[position] != generation
+            }) {
+                slot_candidates.push(idx);
+            }
             if let Some(best) =
                 best_candidate_index(&slot_candidates, stats, blended, burst_prefix, config)
             {
                 chosen.push(best);
-                chosen_mask[best] = true;
+                let position = candidate_positions[best];
+                chosen_generation[position] = generation;
             }
         }
 
         if chosen.len() < max_additions {
-            let mut remaining = filtered.clone();
+            remaining.clear();
+            remaining.extend(filtered.iter().copied());
             remaining.sort_unstable_by(|a, b| blended[*b].total_cmp(&blended[*a]));
-            for idx in remaining {
+            for idx in remaining.iter().copied() {
                 if chosen.len() >= max_additions {
                     break;
                 }
-                if !chosen_mask[idx] {
+                let position = candidate_positions[idx];
+                if chosen_generation[position] != generation {
                     chosen.push(idx);
-                    chosen_mask[idx] = true;
+                    chosen_generation[position] = generation;
                 }
             }
         }
 
-        recovered.extend(chosen.into_iter().map(|idx| stats[idx].frame_index));
+        recovered.extend(chosen.iter().copied().map(|idx| stats[idx].frame_index));
     }
 
     recovered
