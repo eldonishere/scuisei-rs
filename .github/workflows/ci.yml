@@ -11,7 +11,7 @@ env:
 
 jobs:
   rust_checks:
-    name: Rust Checks (${{ matrix.os }})
+    name: Rust Checks (${{ matrix.os }}, stable)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -50,7 +50,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.1
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Check Formatting
@@ -78,10 +78,33 @@ jobs:
       - name: Run Doc Tests
         run: cargo test --doc
 
+  rust_msrv:
+    name: Rust MSRV (ubuntu, 1.93)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg dependencies (Linux)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config patchelf nasm libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run Tests
+        run: cargo test --release --all-targets
+
+      - name: Check Python Feature (no link)
+        run: cargo check --features python --lib
+
   python_wheels:
     name: Python Wheels (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: rust_checks
+    needs: [rust_checks, rust_msrv]
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +143,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.1
+          toolchain: stable
 
       - name: Set up Python
         uses: actions/setup-python@v5
