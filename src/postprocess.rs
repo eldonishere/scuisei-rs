@@ -143,6 +143,12 @@ pub struct FrameCutStats {
     pub grid_hist_median: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CandidateMeta {
+    index: usize,
+    is_cut_fallback: bool,
+}
+
 fn is_local_peak(values: &[f64], index: usize, radius: usize) -> bool {
     if values.is_empty() || index >= values.len() {
         return false;
@@ -226,8 +232,8 @@ fn collect_candidates(
     grid_hist: &[f64],
     burst_prefix: &[usize],
     config: &PostprocessConfig,
-) -> Vec<usize> {
-    let mut candidates: Vec<usize> = Vec::new();
+) -> Vec<CandidateMeta> {
+    let mut candidates: Vec<CandidateMeta> = Vec::new();
     for (index, stat) in stats.iter().enumerate() {
         let burst_count = burst_count_at_index(burst_prefix, index, blended.len(), config);
         let in_activity_burst = burst_count >= config.temporal_burst_min_count;
@@ -261,51 +267,214 @@ fn collect_candidates(
             && is_local_peak(grid_hist, index, config.candidate_peak_radius);
         let cut_fallback = is_cut_fallback_candidate(stat, in_activity_burst, config);
         if primary || structural || cut_fallback {
-            candidates.push(index);
+            candidates.push(CandidateMeta {
+                index,
+                is_cut_fallback: cut_fallback,
+            });
         }
     }
     candidates
 }
 
 fn best_candidate_index(
-    candidates: &[usize],
+    candidates: &[CandidateMeta],
     stats: &[FrameCutStats],
     blended: &[f64],
-    burst_prefix: &[usize],
-    config: &PostprocessConfig,
 ) -> Option<usize> {
     if let Some(fallback) = candidates
         .iter()
         .copied()
-        .filter(|idx| {
-            let burst_count = burst_count_at_index(burst_prefix, *idx, blended.len(), config);
-            let in_activity_burst = burst_count >= config.temporal_burst_min_count;
-            is_cut_fallback_candidate(&stats[*idx], in_activity_burst, config)
-        })
-        .min_by_key(|idx| stats[*idx].frame_index)
+        .filter(|candidate| candidate.is_cut_fallback)
+        .min_by_key(|candidate| stats[candidate.index].frame_index)
     {
-        return Some(fallback);
+        return Some(fallback.index);
     }
 
     candidates
         .iter()
-        .copied()
-        .max_by(|left, right| blended[*left].total_cmp(&blended[*right]))
+        .max_by(|left, right| blended[left.index].total_cmp(&blended[right.index]))
+        .map(|candidate| candidate.index)
+}
+
+fn build_candidate_positions(stats_len: usize, candidates: &[CandidateMeta]) -> Vec<usize> {
+    let mut positions = vec![usize::MAX; stats_len];
+    for (position, candidate) in candidates.iter().copied().enumerate() {
+        positions[candidate.index] = position;
+    }
+    positions
+}
+
+fn dense_recovery_interval<'a>(
+    stats: &[FrameCutStats],
+    candidate_indices: &'a [CandidateMeta],
+    interval_start: &mut usize,
+    interval_end: &mut usize,
+    left: usize,
+    right: usize,
+) -> &'a [CandidateMeta] {
+    while *interval_start < candidate_indices.len()
+        && stats[candidate_indices[*interval_start].index].frame_index <= left
+    {
+        *interval_start += 1;
+    }
+    *interval_end = (*interval_end).max(*interval_start);
+    while *interval_end < candidate_indices.len()
+        && stats[candidate_indices[*interval_end].index].frame_index < right
+    {
+        *interval_end += 1;
+    }
+
+    &candidate_indices[*interval_start..*interval_end]
+}
+
+fn collect_filtered_dense_candidates(
+    filtered: &mut Vec<CandidateMeta>,
+    interval_candidates: &[CandidateMeta],
+    stats: &[FrameCutStats],
+    blended: &[f64],
+    left: usize,
+    right: usize,
+    config: &PostprocessConfig,
+) {
+    filtered.clear();
+    filtered.extend(interval_candidates.iter().copied().filter(|candidate| {
+        let frame = stats[candidate.index].frame_index;
+        frame.saturating_sub(left) >= config.dense_recovery_margin_frames
+            && right.saturating_sub(frame) >= config.dense_recovery_margin_frames
+            && blended[candidate.index] >= config.dense_recovery_blend_min
+            && stats[candidate.index].score >= config.dense_recovery_score_min
+    }));
+}
+
+fn should_replace_slot_candidate(
+    candidate: CandidateMeta,
+    current_best: Option<CandidateMeta>,
+    stats: &[FrameCutStats],
+    blended: &[f64],
+) -> bool {
+    match current_best {
+        None => true,
+        Some(best) if candidate.is_cut_fallback && !best.is_cut_fallback => true,
+        Some(best) if candidate.is_cut_fallback == best.is_cut_fallback => {
+            if candidate.is_cut_fallback {
+                stats[candidate.index].frame_index < stats[best.index].frame_index
+            } else {
+                blended[candidate.index] > blended[best.index]
+            }
+        }
+        Some(_) => false,
+    }
+}
+
+struct DenseRecoverySlotParams<'a> {
+    stats: &'a [FrameCutStats],
+    blended: &'a [f64],
+    left: usize,
+    gap: usize,
+    max_additions: usize,
+    candidate_positions: &'a [usize],
+    chosen_generation: &'a mut [u32],
+    generation: u32,
+}
+
+fn select_dense_slot_candidates(
+    filtered: &[CandidateMeta],
+    params: &mut DenseRecoverySlotParams<'_>,
+    chosen: &mut Vec<usize>,
+    slot_best: &mut Vec<Option<CandidateMeta>>,
+) {
+    let slots = params.max_additions + 1;
+    chosen.clear();
+    slot_best.clear();
+    slot_best.resize(params.max_additions, None);
+
+    for candidate in filtered.iter().copied() {
+        let frame = params.stats[candidate.index].frame_index;
+        let position = params.candidate_positions[candidate.index];
+        if params.chosen_generation[position] == params.generation {
+            continue;
+        }
+
+        for (slot, best_for_slot) in slot_best.iter_mut().enumerate() {
+            let start = params.left + (params.gap.saturating_mul(slot) / slots);
+            let end = params.left + (params.gap.saturating_mul(slot + 1) / slots);
+            if frame < start || frame > end {
+                continue;
+            }
+
+            if should_replace_slot_candidate(
+                candidate,
+                *best_for_slot,
+                params.stats,
+                params.blended,
+            ) {
+                *best_for_slot = Some(candidate);
+            }
+            break;
+        }
+    }
+
+    for best in slot_best.iter().flatten().copied() {
+        let position = params.candidate_positions[best.index];
+        if params.chosen_generation[position] == params.generation {
+            continue;
+        }
+        chosen.push(best.index);
+        params.chosen_generation[position] = params.generation;
+    }
+}
+
+fn fill_remaining_dense_candidates(
+    chosen: &mut Vec<usize>,
+    filtered: &[CandidateMeta],
+    blended: &[f64],
+    candidate_positions: &[usize],
+    chosen_generation: &mut [u32],
+    generation: u32,
+    max_additions: usize,
+) {
+    while chosen.len() < max_additions {
+        let mut best_remaining: Option<CandidateMeta> = None;
+        for candidate in filtered.iter().copied() {
+            let position = candidate_positions[candidate.index];
+            if chosen_generation[position] == generation {
+                continue;
+            }
+
+            best_remaining = match best_remaining {
+                None => Some(candidate),
+                Some(current_best) if blended[candidate.index] > blended[current_best.index] => {
+                    Some(candidate)
+                }
+                Some(current_best) => Some(current_best),
+            };
+        }
+
+        let Some(best_remaining) = best_remaining else {
+            break;
+        };
+
+        let idx = best_remaining.index;
+        let position = candidate_positions[idx];
+        if chosen_generation[position] != generation {
+            chosen.push(idx);
+            chosen_generation[position] = generation;
+        }
+    }
 }
 
 fn select_cluster_peaks(
     stats: &[FrameCutStats],
-    candidate_indices: &[usize],
+    candidate_indices: &[CandidateMeta],
     blended: &[f64],
-    burst_prefix: &[usize],
     config: &PostprocessConfig,
 ) -> Vec<usize> {
     let mut refined: Vec<usize> = vec![0];
-    let mut cluster: Vec<usize> = Vec::new();
+    let mut cluster: Vec<CandidateMeta> = Vec::new();
     let mut previous_frame: Option<usize> = None;
 
     for candidate in candidate_indices.iter().copied() {
-        let frame = stats[candidate].frame_index;
+        let frame = stats[candidate.index].frame_index;
         if previous_frame.is_some_and(|prev| frame.saturating_sub(prev) < config.cluster_gap_frames)
         {
             cluster.push(candidate);
@@ -313,7 +482,7 @@ fn select_cluster_peaks(
             continue;
         }
 
-        if let Some(best) = best_candidate_index(&cluster, stats, blended, burst_prefix, config) {
+        if let Some(best) = best_candidate_index(&cluster, stats, blended) {
             refined.push(stats[best].frame_index);
         }
         cluster.clear();
@@ -321,7 +490,7 @@ fn select_cluster_peaks(
         previous_frame = Some(frame);
     }
 
-    if let Some(best) = best_candidate_index(&cluster, stats, blended, burst_prefix, config) {
+    if let Some(best) = best_candidate_index(&cluster, stats, blended) {
         refined.push(stats[best].frame_index);
     }
 
@@ -330,24 +499,20 @@ fn select_cluster_peaks(
 
 fn recover_dense_candidates(
     stats: &[FrameCutStats],
-    candidate_indices: &[usize],
+    candidate_indices: &[CandidateMeta],
     blended: &[f64],
-    burst_prefix: &[usize],
     refined: &[usize],
     config: &PostprocessConfig,
 ) -> Vec<usize> {
     let mut recovered: Vec<usize> = Vec::new();
-    let mut interval_candidates: Vec<usize> = Vec::new();
-    let mut filtered: Vec<usize> = Vec::new();
+    let mut filtered: Vec<CandidateMeta> = Vec::new();
     let mut chosen: Vec<usize> = Vec::new();
-    let mut slot_candidates: Vec<usize> = Vec::new();
-    let mut remaining: Vec<usize> = Vec::new();
+    let mut slot_best: Vec<Option<CandidateMeta>> = Vec::new();
     let mut chosen_generation: Vec<u32> = vec![0; candidate_indices.len()];
     let mut generation: u32 = 1;
-    let mut candidate_positions: Vec<usize> = vec![usize::MAX; stats.len()];
-    for (position, candidate_index) in candidate_indices.iter().copied().enumerate() {
-        candidate_positions[candidate_index] = position;
-    }
+    let candidate_positions = build_candidate_positions(stats.len(), candidate_indices);
+    let mut interval_start = 0_usize;
+    let mut interval_end = 0_usize;
 
     for window in refined.windows(2) {
         let left = window[0];
@@ -357,82 +522,66 @@ fn recover_dense_candidates(
             continue;
         }
 
-        interval_candidates.clear();
-        for idx in candidate_indices.iter().copied().filter(|idx| {
-            let frame = stats[*idx].frame_index;
-            frame > left && frame < right
-        }) {
-            interval_candidates.push(idx);
-        }
+        let interval_candidates = dense_recovery_interval(
+            stats,
+            candidate_indices,
+            &mut interval_start,
+            &mut interval_end,
+            left,
+            right,
+        );
         if interval_candidates.len() < config.dense_recovery_min_candidates {
             continue;
         }
 
-        filtered.clear();
-        for idx in interval_candidates.iter().copied().filter(|idx| {
-            let frame = stats[*idx].frame_index;
-            frame.saturating_sub(left) >= config.dense_recovery_margin_frames
-                && right.saturating_sub(frame) >= config.dense_recovery_margin_frames
-                && blended[*idx] >= config.dense_recovery_blend_min
-                && stats[*idx].score >= config.dense_recovery_score_min
-        }) {
-            filtered.push(idx);
-        }
+        collect_filtered_dense_candidates(
+            &mut filtered,
+            interval_candidates,
+            stats,
+            blended,
+            left,
+            right,
+            config,
+        );
         if filtered.is_empty() {
             continue;
         }
 
         let max_additions = (gap / config.dense_recovery_target_span_frames).max(1);
         if max_additions == 1 {
-            if let Some(best) =
-                best_candidate_index(&filtered, stats, blended, burst_prefix, config)
-            {
+            if let Some(best) = best_candidate_index(&filtered, stats, blended) {
                 recovered.push(stats[best].frame_index);
             }
             continue;
         }
 
-        let slots = max_additions + 1;
-        chosen.clear();
         generation = generation.wrapping_add(1);
         if generation == 0 {
             chosen_generation.fill(0);
             generation = 1;
         }
-        for slot in 0..max_additions {
-            let start = left + (gap.saturating_mul(slot) / slots);
-            let end = left + (gap.saturating_mul(slot + 1) / slots);
-            slot_candidates.clear();
-            for idx in filtered.iter().copied().filter(|idx| {
-                let frame = stats[*idx].frame_index;
-                let position = candidate_positions[*idx];
-                frame >= start && frame <= end && chosen_generation[position] != generation
-            }) {
-                slot_candidates.push(idx);
-            }
-            if let Some(best) =
-                best_candidate_index(&slot_candidates, stats, blended, burst_prefix, config)
-            {
-                chosen.push(best);
-                let position = candidate_positions[best];
-                chosen_generation[position] = generation;
-            }
-        }
+        let mut slot_params = DenseRecoverySlotParams {
+            stats,
+            blended,
+            left,
+            gap,
+            max_additions,
+            candidate_positions: &candidate_positions,
+            chosen_generation: &mut chosen_generation,
+            generation,
+        };
+        select_dense_slot_candidates(&filtered, &mut slot_params, &mut chosen, &mut slot_best);
 
         if chosen.len() < max_additions {
-            remaining.clear();
-            remaining.extend(filtered.iter().copied());
-            remaining.sort_unstable_by(|a, b| blended[*b].total_cmp(&blended[*a]));
-            for idx in remaining.iter().copied() {
-                if chosen.len() >= max_additions {
-                    break;
-                }
-                let position = candidate_positions[idx];
-                if chosen_generation[position] != generation {
-                    chosen.push(idx);
-                    chosen_generation[position] = generation;
-                }
-            }
+            fill_remaining_dense_candidates(
+                &mut chosen,
+                &filtered,
+                blended,
+                &candidate_positions,
+                &mut chosen_generation,
+                generation,
+                max_additions,
+            );
         }
 
         recovered.extend(chosen.iter().copied().map(|idx| stats[idx].frame_index));
@@ -459,16 +608,8 @@ pub fn refine_frame_keyframes_with_config(
         return baseline_keyframes;
     }
 
-    let mut refined =
-        select_cluster_peaks(stats, &candidate_indices, &blended, &burst_prefix, config);
-    let recovered = recover_dense_candidates(
-        stats,
-        &candidate_indices,
-        &blended,
-        &burst_prefix,
-        &refined,
-        config,
-    );
+    let mut refined = select_cluster_peaks(stats, &candidate_indices, &blended, config);
+    let recovered = recover_dense_candidates(stats, &candidate_indices, &blended, &refined, config);
     refined.extend(recovered);
     refined.sort_unstable();
     refined.dedup();

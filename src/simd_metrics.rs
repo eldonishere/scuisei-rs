@@ -75,6 +75,13 @@ pub struct GridHistogramPlan {
     x_cell_offsets: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameMetrics {
+    pub sad: u64,
+    pub hist: [u32; 16],
+    pub grid_hist: [u32; GRID_HIST_LEN],
+}
+
 impl GridHistogramPlan {
     #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
@@ -123,6 +130,56 @@ impl GridHistogramPlan {
 
         hist
     }
+
+    #[must_use]
+    pub fn accumulate_frame_metrics(&self, prev: Option<&[u8]>, curr: &[u8]) -> FrameMetrics {
+        let mut hist = [0_u32; 16];
+        let mut grid_hist = [0_u32; GRID_HIST_LEN];
+        let height = self.row_cell_bases.len();
+        let needed = self.width.saturating_mul(height);
+        if self.width == 0 || height == 0 || curr.len() < needed {
+            return FrameMetrics {
+                sad: 0,
+                hist,
+                grid_hist,
+            };
+        }
+
+        let prev = prev.filter(|frame| frame.len() >= needed);
+        let mut sad = 0_u64;
+
+        for (y, row_cell_base) in self.row_cell_bases.iter().copied().enumerate() {
+            let row = y * self.width;
+            if let Some(prev_frame) = prev {
+                sad = sad.saturating_add(sad_u8(
+                    &prev_frame[row..row + self.width],
+                    &curr[row..row + self.width],
+                ));
+            }
+            for (x, cell_offset) in self.x_cell_offsets.iter().copied().enumerate() {
+                let idx = row + x;
+                let pixel = curr[idx];
+                let bin = usize::from(pixel >> 4);
+                hist[bin] += 1;
+                grid_hist[row_cell_base + cell_offset + bin] += 1;
+            }
+        }
+
+        FrameMetrics {
+            sad,
+            hist,
+            grid_hist,
+        }
+    }
+}
+
+#[must_use]
+pub fn frame_pair_metrics(
+    prev: Option<&[u8]>,
+    curr: &[u8],
+    grid_plan: &GridHistogramPlan,
+) -> FrameMetrics {
+    grid_plan.accumulate_frame_metrics(prev, curr)
 }
 
 #[must_use]
@@ -258,14 +315,18 @@ pub fn grid_histogram_median_cell_distance_16_from_hists(
     }
 
     let slice = &mut distances[..count];
-    slice.sort_by(f64::total_cmp);
     let mid = count / 2;
-    if count % 2 == 1 {
-        slice[mid]
-    } else if mid == 0 {
-        slice[0]
+    slice.select_nth_unstable_by(mid, f64::total_cmp);
+    let upper = slice[mid];
+    if count % 2 == 1 || mid == 0 {
+        upper
     } else {
-        (slice[mid - 1] + slice[mid]) * 0.5
+        let lower = slice[..mid]
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .unwrap_or(upper);
+        (lower + upper) * 0.5
     }
 }
 
@@ -345,21 +406,37 @@ struct MotionMatch {
     dy: i32,
 }
 
-fn sad16x16(
-    prev: &[u8],
-    curr: &[u8],
-    width: usize,
+#[derive(Clone, Copy, Debug)]
+struct BlockPair {
     curr_x: usize,
     curr_y: usize,
     prev_x: usize,
     prev_y: usize,
+}
+
+fn sad16x16_with_cutoff(
+    prev: &[u8],
+    curr: &[u8],
+    width: usize,
+    pair: BlockPair,
+    cutoff: u32,
 ) -> u32 {
     let mut total: u32 = 0;
     for y in 0..16_usize {
-        let curr_row = (curr_y + y) * width;
-        let prev_row = (prev_y + y) * width;
-        for x in 0..16_usize {
-            total += u32::from(curr[curr_row + curr_x + x].abs_diff(prev[prev_row + prev_x + x]));
+        let curr_row = (pair.curr_y + y) * width;
+        let prev_row = (pair.prev_y + y) * width;
+        let curr_idx = curr_row + pair.curr_x;
+        let prev_idx = prev_row + pair.prev_x;
+        let a = load_u8x16(&curr[curr_idx..]);
+        let b = load_u8x16(&prev[prev_idx..]);
+        let diff = a.max(b) - a.min(b);
+
+        let low = u16x8::from_u8x16_low(diff);
+        let high = u16x8::from_u8x16_high(diff);
+        let row_total = sum_u16x8(low).saturating_add(sum_u16x8(high));
+        total = total.saturating_add(u32::try_from(row_total).unwrap_or(u32::MAX));
+        if total > cutoff {
+            return total;
         }
     }
     total
@@ -410,14 +487,17 @@ fn find_best_match_for_block(
                 continue;
             };
 
-            let sad = sad16x16(
+            let sad = sad16x16_with_cutoff(
                 prev,
                 curr,
                 width,
-                block_x,
-                block_y,
-                candidate_col,
-                candidate_row,
+                BlockPair {
+                    curr_x: block_x,
+                    curr_y: block_y,
+                    prev_x: candidate_col,
+                    prev_y: candidate_row,
+                },
+                best.sad,
             );
             if sad < best.sad {
                 best.sad = sad;
@@ -444,23 +524,24 @@ fn dev_block(
     }
 
     let mut sum: u32 = 0;
+    let mut histogram = [0_u16; 256];
     for y in 0..block_h {
         let row = (curr_y + y).saturating_mul(width);
         for x in 0..block_w {
-            sum = sum.saturating_add(u32::from(curr[row + curr_x + x]));
+            let pixel = curr[row + curr_x + x];
+            sum = sum.saturating_add(u32::from(pixel));
+            histogram[usize::from(pixel)] = histogram[usize::from(pixel)].saturating_add(1);
         }
     }
 
     let mean = sum / u32::try_from(area).unwrap_or(u32::MAX);
-    let mut dev: u32 = 0;
-    for y in 0..block_h {
-        let row = (curr_y + y).saturating_mul(width);
-        for x in 0..block_w {
-            dev = dev.saturating_add(u32::from(curr[row + curr_x + x]).abs_diff(mean));
-        }
-    }
-
-    dev
+    histogram
+        .into_iter()
+        .enumerate()
+        .fold(0_u32, |acc, (value, count)| {
+            let value_u32 = u32::try_from(value).unwrap_or(u32::MAX);
+            acc.saturating_add(u32::from(count).saturating_mul(value_u32.abs_diff(mean)))
+        })
 }
 
 fn superblock_indices(macroblock_count: usize) -> Vec<usize> {
@@ -618,14 +699,17 @@ fn search_superblock_matches(
                 continue;
             };
 
-            let block_sad_0 = sad16x16(
+            let block_sad_0 = sad16x16_with_cutoff(
                 prev,
                 curr,
                 width,
-                base_x,
-                base_y,
-                candidate_col,
-                candidate_row,
+                BlockPair {
+                    curr_x: base_x,
+                    curr_y: base_y,
+                    prev_x: candidate_col,
+                    prev_y: candidate_row,
+                },
+                result.sad[0],
             );
             if block_sad_0 < result.sad[0] {
                 result.sad[0] = block_sad_0;
@@ -633,14 +717,17 @@ fn search_superblock_matches(
                 result.dy[0] = offset_y;
             }
 
-            let block_sad_1 = sad16x16(
+            let block_sad_1 = sad16x16_with_cutoff(
                 prev,
                 curr,
                 width,
-                base_x + BLOCK_EDGE,
-                base_y,
-                candidate_col + BLOCK_EDGE,
-                candidate_row,
+                BlockPair {
+                    curr_x: base_x + BLOCK_EDGE,
+                    curr_y: base_y,
+                    prev_x: candidate_col + BLOCK_EDGE,
+                    prev_y: candidate_row,
+                },
+                result.sad[1],
             );
             if block_sad_1 < result.sad[1] {
                 result.sad[1] = block_sad_1;
@@ -648,14 +735,17 @@ fn search_superblock_matches(
                 result.dy[1] = offset_y;
             }
 
-            let block_sad_2 = sad16x16(
+            let block_sad_2 = sad16x16_with_cutoff(
                 prev,
                 curr,
                 width,
-                base_x,
-                base_y + BLOCK_EDGE,
-                candidate_col,
-                candidate_row + BLOCK_EDGE,
+                BlockPair {
+                    curr_x: base_x,
+                    curr_y: base_y + BLOCK_EDGE,
+                    prev_x: candidate_col,
+                    prev_y: candidate_row + BLOCK_EDGE,
+                },
+                result.sad[2],
             );
             if block_sad_2 < result.sad[2] {
                 result.sad[2] = block_sad_2;
@@ -663,14 +753,17 @@ fn search_superblock_matches(
                 result.dy[2] = offset_y;
             }
 
-            let block_sad_3 = sad16x16(
+            let block_sad_3 = sad16x16_with_cutoff(
                 prev,
                 curr,
                 width,
-                base_x + BLOCK_EDGE,
-                base_y + BLOCK_EDGE,
-                candidate_col + BLOCK_EDGE,
-                candidate_row + BLOCK_EDGE,
+                BlockPair {
+                    curr_x: base_x + BLOCK_EDGE,
+                    curr_y: base_y + BLOCK_EDGE,
+                    prev_x: candidate_col + BLOCK_EDGE,
+                    prev_y: candidate_row + BLOCK_EDGE,
+                },
+                result.sad[3],
             );
             if block_sad_3 < result.sad[3] {
                 result.sad[3] = block_sad_3;
@@ -844,20 +937,28 @@ fn build_motion_analysis_plan(
     })
 }
 
-fn cached_motion_analysis_plan(
+fn with_cached_motion_analysis_plan<T, F>(
     width: usize,
     height: usize,
     search_radius: i32,
-) -> Option<MotionAnalysisPlan> {
+    f: F,
+) -> T
+where
+    F: FnOnce(Option<&MotionAnalysisPlan>) -> T,
+{
     MOTION_PLAN_CACHE.with(|cache| {
-        let needs_refresh = cache.borrow().as_ref().is_none_or(|plan| {
-            plan.width != width || plan.height != height || plan.search_radius != search_radius
-        });
-        if needs_refresh {
-            *cache.borrow_mut() = build_motion_analysis_plan(width, height, search_radius);
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let needs_refresh = cache_ref.as_ref().is_none_or(|plan| {
+                plan.width != width || plan.height != height || plan.search_radius != search_radius
+            });
+            if needs_refresh {
+                *cache_ref = build_motion_analysis_plan(width, height, search_radius);
+            }
         }
 
-        cache.borrow().clone()
+        let cache_ref = cache.borrow();
+        f(cache_ref.as_ref())
     })
 }
 
@@ -951,11 +1052,11 @@ pub fn meanalysis_xvid_like(
         return small_frame_meanalysis(prev, curr, width, height, search_radius, intra_thresh_u32);
     }
 
-    let Some(plan) = cached_motion_analysis_plan(width, height, search_radius) else {
-        return empty_me_analysis();
-    };
-
-    run_superblock_motion_analysis(prev, curr, intra_thresh_u32, &plan)
+    with_cached_motion_analysis_plan(width, height, search_radius, |plan| {
+        plan.map_or_else(empty_me_analysis, |plan| {
+            run_superblock_motion_analysis(prev, curr, intra_thresh_u32, plan)
+        })
+    })
 }
 
 fn load_u8x16(bytes: &[u8]) -> u8x16 {
@@ -1109,6 +1210,69 @@ mod tests {
         let planned = GridHistogramPlan::new(width, height).run(&frame);
 
         assert_eq!(planned, direct);
+    }
+
+    #[test]
+    fn accumulated_frame_metrics_match_separate_paths() {
+        let width: usize = 96;
+        let height: usize = 54;
+        let prev = make_frame(width * height, 5);
+        let curr = make_frame(width * height, 17);
+        let plan = GridHistogramPlan::new(width, height);
+
+        let combined = plan.accumulate_frame_metrics(Some(&prev), &curr);
+
+        assert_eq!(combined.sad, sad_u8(&prev, &curr));
+        assert_eq!(combined.hist, histogram_16(&curr));
+        assert_eq!(combined.grid_hist, plan.run(&curr));
+    }
+
+    #[test]
+    fn cutoff_sad_matches_full_sad_when_not_cut() {
+        let width: usize = 64;
+        let height: usize = 64;
+        let prev = make_frame(width * height, 0);
+        let curr = make_frame(width * height, 9);
+
+        let pair = BlockPair {
+            curr_x: 16,
+            curr_y: 16,
+            prev_x: 16,
+            prev_y: 16,
+        };
+        let full = sad16x16_with_cutoff(&prev, &curr, width, pair, u32::MAX);
+        let cutoff = sad16x16_with_cutoff(&prev, &curr, width, pair, full);
+
+        assert_eq!(cutoff, full);
+    }
+
+    #[test]
+    fn dev_block_histogram_matches_scalar_baseline() {
+        let width: usize = 64;
+        let height: usize = 64;
+        let curr = make_frame(width * height, 13);
+
+        let scalar = {
+            let mut sum: u32 = 0;
+            for y in 0..16_usize {
+                let row = (8 + y) * width;
+                for x in 0..16_usize {
+                    sum = sum.saturating_add(u32::from(curr[row + 12 + x]));
+                }
+            }
+
+            let mean = sum / 256;
+            let mut dev = 0_u32;
+            for y in 0..16_usize {
+                let row = (8 + y) * width;
+                for x in 0..16_usize {
+                    dev = dev.saturating_add(u32::from(curr[row + 12 + x]).abs_diff(mean));
+                }
+            }
+            dev
+        };
+
+        assert_eq!(dev_block(&curr, width, 12, 8, 16, 16), scalar);
     }
 
     #[test]

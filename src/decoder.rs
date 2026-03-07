@@ -148,6 +148,7 @@ pub struct FrameInfo {
 pub struct Decoder {
     ictx: ffmpeg::format::context::Input,
     video_stream_index: usize,
+    frame_count_hint: Option<usize>,
     video: ffmpeg::decoder::Video,
     scaler: Option<ScalingContext>,
     scaler_input: Option<ScalerInput>,
@@ -190,6 +191,9 @@ impl Decoder {
             .best(Type::Video)
             .ok_or_else(|| SCuiseiError::unsupported("no video stream found"))?;
         let video_stream_index = input.index();
+        let frame_count_hint = usize::try_from(input.frames())
+            .ok()
+            .filter(|count| *count > 0);
 
         let mut context_decoder = ffmpeg::codec::context::Context::from_parameters(
             input.parameters(),
@@ -225,6 +229,7 @@ impl Decoder {
         Ok(Self {
             ictx,
             video_stream_index,
+            frame_count_hint,
             video,
             scaler: None,
             scaler_input: None,
@@ -232,9 +237,14 @@ impl Decoder {
         })
     }
 
+    #[must_use]
+    pub fn frame_count_hint(&self) -> Option<usize> {
+        self.frame_count_hint
+    }
+
     pub fn decode_luma_frames<F>(&mut self, mut on_frame: F) -> SCuiseiResult<()>
     where
-        F: FnMut(&mut Vec<u8>, FrameInfo) -> SCuiseiResult<()>,
+        F: FnMut(&[u8], FrameInfo) -> SCuiseiResult<()>,
     {
         let mut buffers = DecodeFrameBuffers::new();
 
@@ -291,7 +301,7 @@ fn receive_and_process_frames<F>(
     on_frame: &mut F,
 ) -> SCuiseiResult<()>
 where
-    F: FnMut(&mut Vec<u8>, FrameInfo) -> SCuiseiResult<()>,
+    F: FnMut(&[u8], FrameInfo) -> SCuiseiResult<()>,
 {
     loop {
         match decoder.receive_frame(&mut buffers.decoded) {
@@ -322,16 +332,30 @@ where
             height: frame.height() as usize,
         };
 
-        if is_direct_luma_format(frame.format()) {
-            copy_luma_plane(frame, &mut buffers.luma).map_err(|error| decode_anyhow(&error))?;
+        let pixels = if is_direct_luma_format(frame.format()) {
+            if let Some(luma) =
+                borrow_packed_luma_plane(frame).map_err(|error| decode_anyhow(&error))?
+            {
+                luma
+            } else {
+                copy_luma_plane(frame, &mut buffers.luma).map_err(|error| decode_anyhow(&error))?;
+                buffers.luma.as_slice()
+            }
         } else {
             scale_to_gray8(scaler, scaler_input, frame, &mut buffers.gray)
                 .map_err(|error| decode_anyhow(&error))?;
-            copy_luma_plane(&buffers.gray, &mut buffers.luma)
-                .map_err(|error| decode_anyhow(&error))?;
-        }
+            if let Some(luma) =
+                borrow_packed_luma_plane(&buffers.gray).map_err(|error| decode_anyhow(&error))?
+            {
+                luma
+            } else {
+                copy_luma_plane(&buffers.gray, &mut buffers.luma)
+                    .map_err(|error| decode_anyhow(&error))?;
+                buffers.luma.as_slice()
+            }
+        };
 
-        on_frame(&mut buffers.luma, info)?;
+        on_frame(pixels, info)?;
     }
 
     Ok(())
@@ -441,6 +465,37 @@ fn is_direct_luma_format(format: Pixel) -> bool {
             | Pixel::NV12
             | Pixel::NV21
     )
+}
+
+fn borrow_packed_luma_plane(frame: &Video) -> AnyResult<Option<&[u8]>> {
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.stride(0);
+
+    if stride < width {
+        anyhow::bail!("unexpected luma stride ({stride}) for width ({width})");
+    }
+
+    let needed = width.checked_mul(height).context("frame size overflow")?;
+    let data = frame.data(0);
+    let src_needed = stride
+        .checked_mul(height)
+        .context("stride multiplication overflow")?;
+    if data.len() < src_needed {
+        anyhow::bail!(
+            "insufficient luma data (have {}, need {src_needed})",
+            data.len()
+        );
+    }
+
+    if stride == width {
+        let src = data
+            .get(..needed)
+            .context("insufficient luma data for contiguous borrow")?;
+        return Ok(Some(src));
+    }
+
+    Ok(None)
 }
 
 fn copy_luma_plane(frame: &Video, out: &mut Vec<u8>) -> AnyResult<()> {

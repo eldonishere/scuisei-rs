@@ -31,6 +31,24 @@ $ ./scuisei-rs -i input.mp4 --native-res # slow - and default thresholds are tun
 
 `--hwdec` keeps decode on the requested device when possible, but frames are still transferred back to CPU memory for analysis, so end-to-end speedups depend on the input and hardware stack.
 
+## Benchmarking
+
+The repo includes a fixture benchmark script for the checked-in `bleach` and `monogatari` clips.
+
+```bash
+cargo build --release
+python3 scripts/benchmark_fixtures.py --binary target/release/scuisei-rs --output-json target/bench/baseline.json
+
+# after making changes
+cargo build --release
+python3 scripts/benchmark_fixtures.py \
+  --binary target/release/scuisei-rs \
+  --output-json target/bench/final.json \
+  --baseline-json target/bench/baseline.json
+```
+
+The script benchmarks `target/release/scuisei-rs -i <fixture> --format frames`, prints a Markdown table, and writes JSON with per-fixture `median_s`, `mean_s`, `stdev_s`, `min_s`, `max_s`, and optional `speedup_vs_baseline` fields.
+
 ## API (Rust)
 
 ```rust

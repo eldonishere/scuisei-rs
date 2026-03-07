@@ -67,7 +67,9 @@ struct CurrentFrameSnapshot {
 
 struct CurrentFrame<'a> {
     pixels: &'a [u8],
-    snapshot: CurrentFrameSnapshot,
+    width: usize,
+    height: usize,
+    grid_hist_plan: &'a simd_metrics::GridHistogramPlan,
 }
 
 #[derive(Debug)]
@@ -170,7 +172,7 @@ impl DetectionState {
 
     fn absorb(
         &mut self,
-        curr_luma: &mut Vec<u8>,
+        curr_luma: &[u8],
         curr_small: &mut Vec<u8>,
         native_res: bool,
         snapshot: &CurrentFrameSnapshot,
@@ -179,7 +181,8 @@ impl DetectionState {
         self.prev_hist = snapshot.hist;
         self.prev_grid_hist = snapshot.grid_hist;
         if native_res {
-            std::mem::swap(&mut self.prev_small, curr_luma);
+            self.prev_small.resize(curr_luma.len(), 0);
+            self.prev_small.copy_from_slice(curr_luma);
         } else {
             std::mem::swap(&mut self.prev_small, curr_small);
         }
@@ -229,35 +232,24 @@ fn prepare_current_frame<'a>(
     info: decoder::FrameInfo,
     native_res: bool,
     curr_small: &'a mut Vec<u8>,
-    cache: &mut FramePreparationCache,
+    cache: &'a mut FramePreparationCache,
 ) -> CurrentFrame<'a> {
-    let (width, height, pixels, grid_hist): (
-        usize,
-        usize,
-        &[u8],
-        [u32; simd_metrics::GRID_HIST_LEN],
-    ) = if native_res {
-        let grid_hist = cache
-            .native_grid_plan(info.width, info.height)
-            .run(curr_luma);
-        (info.width, info.height, curr_luma, grid_hist)
+    let (width, height, pixels, grid_hist_plan) = if native_res {
+        let grid_hist_plan = cache.native_grid_plan(info.width, info.height);
+        (info.width, info.height, curr_luma, grid_hist_plan)
     } else {
         let (work_w, work_h) =
             prepare_working_luma(curr_luma, info.width, info.height, curr_small, cache);
-        let grid_hist = cache
-            .working_plan(info.width, info.height)
-            .grid_hist_plan
-            .run(curr_small);
-        (work_w, work_h, curr_small.as_slice(), grid_hist)
+        let grid_hist_plan = &cache.working_plan(info.width, info.height).grid_hist_plan;
+        (work_w, work_h, curr_small.as_slice(), grid_hist_plan)
     };
 
-    let snapshot = CurrentFrameSnapshot {
+    CurrentFrame {
+        pixels,
         width,
         height,
-        hist: simd_metrics::histogram_16(pixels),
-        grid_hist,
-    };
-    CurrentFrame { pixels, snapshot }
+        grid_hist_plan,
+    }
 }
 
 fn analyze_frame(
@@ -265,8 +257,10 @@ fn analyze_frame(
     xvid_detector: &mut detector::XvidDetector,
     adaptive_detector: &mut detector::Detector,
     current: &CurrentFrame<'_>,
+    snapshot: &CurrentFrameSnapshot,
+    sad: u64,
 ) -> DetectionRecord {
-    let dims_changed = state.prev_dims != Some((current.snapshot.width, current.snapshot.height))
+    let dims_changed = state.prev_dims != Some((current.width, current.height))
         || state.prev_small.len() != current.pixels.len();
     if dims_changed || state.prev_small.is_empty() {
         xvid_detector.reset();
@@ -287,27 +281,25 @@ fn analyze_frame(
     let xvid_decision = xvid_detector.decide(
         &state.prev_small,
         current.pixels,
-        current.snapshot.width,
-        current.snapshot.height,
+        current.width,
+        current.height,
     );
     let hist_distance = simd_metrics::histogram_distance_16_from_hists(
         &state.prev_hist,
-        &current.snapshot.hist,
+        &snapshot.hist,
         current.pixels.len(),
     );
     let grid_hist_distance = simd_metrics::grid_histogram_distance_16_from_hists(
         &state.prev_grid_hist,
-        &current.snapshot.grid_hist,
+        &snapshot.grid_hist,
         current.pixels.len(),
     );
     let grid_hist_median = simd_metrics::grid_histogram_median_cell_distance_16_from_hists(
         &state.prev_grid_hist,
-        &current.snapshot.grid_hist,
+        &snapshot.grid_hist,
     );
 
-    let sad = simd_metrics::sad_u8(&state.prev_small, current.pixels);
-    let sad_score =
-        simd_metrics::normalize_sad(sad, current.snapshot.width, current.snapshot.height);
+    let sad_score = simd_metrics::normalize_sad(sad, current.width, current.height);
     let adaptive_score = adaptive_detector.blended_score(sad_score, hist_distance);
     let (adaptive_cut, _) = adaptive_detector.decide_with_threshold(adaptive_score, hist_distance);
     adaptive_detector.observe(adaptive_score);
@@ -389,64 +381,80 @@ fn analyze_video_impl(
 ) -> SCuiseiResult<AnalysisResult> {
     ensure_ffmpeg_initialized()?;
 
+    let mut decoder = decoder::Decoder::open(&options.input, options.hwdec.as_deref())?;
+    let frame_count_hint = decoder.frame_count_hint();
+
     let mut xvid_detector = detector::XvidDetector::new(options.xvid_config);
     let mut adaptive_detector = detector::Detector::new(options.adaptive_config);
     let mut state = DetectionState::new();
     let mut curr_small: Vec<u8> = Vec::new();
     let mut frame_preparation_cache = FramePreparationCache::new();
     let mut frame_stats: Vec<postprocess::FrameCutStats> = if target.needs_keyframes() {
-        Vec::new()
+        Vec::with_capacity(frame_count_hint.map_or(0, |count| count.saturating_sub(1)))
     } else {
         Vec::with_capacity(0)
     };
     let mut pass_decisions: Vec<bool> = if target.needs_pass_decisions() {
-        Vec::new()
+        Vec::with_capacity(frame_count_hint.unwrap_or(0))
     } else {
         Vec::with_capacity(0)
     };
 
-    decoder::Decoder::open(&options.input, options.hwdec.as_deref())?.decode_luma_frames(
-        |curr_luma, info| {
-            let current = prepare_current_frame(
-                curr_luma,
-                info,
-                options.native_res,
-                &mut curr_small,
-                &mut frame_preparation_cache,
-            );
-            let snapshot = current.snapshot;
+    decoder.decode_luma_frames(|curr_luma, info| {
+        let current = prepare_current_frame(
+            curr_luma,
+            info,
+            options.native_res,
+            &mut curr_small,
+            &mut frame_preparation_cache,
+        );
+        let frame_metrics = current.grid_hist_plan.accumulate_frame_metrics(
+            (!state.is_first_frame()).then_some(state.prev_small.as_slice()),
+            current.pixels,
+        );
+        let snapshot = CurrentFrameSnapshot {
+            width: current.width,
+            height: current.height,
+            hist: frame_metrics.hist,
+            grid_hist: frame_metrics.grid_hist,
+        };
 
-            if state.is_first_frame() {
-                if target.needs_pass_decisions() {
-                    pass_decisions.push(true);
-                }
-                state.absorb(curr_luma, &mut curr_small, options.native_res, &snapshot);
-                return Ok(());
-            }
-
-            let record =
-                analyze_frame(&state, &mut xvid_detector, &mut adaptive_detector, &current);
-            if options.dump_scores {
-                dump_score_line(state.frame_index, record);
-            }
+        if state.is_first_frame() {
             if target.needs_pass_decisions() {
-                pass_decisions.push(record.is_cut);
+                pass_decisions.push(true);
             }
-            if target.needs_keyframes() {
-                frame_stats.push(postprocess::FrameCutStats {
-                    frame_index: state.frame_index,
-                    is_cut: record.is_cut,
-                    score: record.score,
-                    hist_distance: record.hist_distance,
-                    grid_hist_distance: record.grid_hist_distance,
-                    grid_hist_median: record.grid_hist_median,
-                });
-            }
-
             state.absorb(curr_luma, &mut curr_small, options.native_res, &snapshot);
-            Ok(())
-        },
-    )?;
+            return Ok(());
+        }
+
+        let record = analyze_frame(
+            &state,
+            &mut xvid_detector,
+            &mut adaptive_detector,
+            &current,
+            &snapshot,
+            frame_metrics.sad,
+        );
+        if options.dump_scores {
+            dump_score_line(state.frame_index, record);
+        }
+        if target.needs_pass_decisions() {
+            pass_decisions.push(record.is_cut);
+        }
+        if target.needs_keyframes() {
+            frame_stats.push(postprocess::FrameCutStats {
+                frame_index: state.frame_index,
+                is_cut: record.is_cut,
+                score: record.score,
+                hist_distance: record.hist_distance,
+                grid_hist_distance: record.grid_hist_distance,
+                grid_hist_median: record.grid_hist_median,
+            });
+        }
+
+        state.absorb(curr_luma, &mut curr_small, options.native_res, &snapshot);
+        Ok(())
+    })?;
 
     let keyframes = if target.needs_keyframes() {
         postprocess::refine_frame_keyframes_with_config(&frame_stats, &options.postprocess_config)

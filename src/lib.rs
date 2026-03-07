@@ -87,6 +87,7 @@ impl AnalyzeOptions {
 /// # Errors
 /// Returns an error if writing to the output stream fails.
 pub fn write_frames_csv<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuiseiResult<()> {
+    let mut writer = std::io::BufWriter::new(writer);
     for (index, frame) in keyframes.iter().enumerate() {
         if index > 0 {
             write!(writer, ",")
@@ -97,6 +98,9 @@ pub fn write_frames_csv<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuise
     }
     writeln!(writer)
         .map_err(|error| SCuiseiError::io("failed to write trailing newline", &error))?;
+    writer
+        .flush()
+        .map_err(|error| SCuiseiError::io("failed to flush frames output", &error))?;
     Ok(())
 }
 
@@ -105,6 +109,7 @@ pub fn write_frames_csv<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuise
 /// # Errors
 /// Returns an error if writing to the output stream fails.
 pub fn write_agi<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuiseiResult<()> {
+    let mut writer = std::io::BufWriter::new(writer);
     writeln!(writer, "# keyframe format v1")
         .map_err(|error| SCuiseiError::io("failed to write AGI header", &error))?;
     writeln!(writer, "fps 0")
@@ -115,6 +120,9 @@ pub fn write_agi<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuiseiResult
         writeln!(writer, "{frame} I -1")
             .map_err(|error| SCuiseiError::io("failed to write AGI keyframe line", &error))?;
     }
+    writer
+        .flush()
+        .map_err(|error| SCuiseiError::io("failed to flush AGI output", &error))?;
     Ok(())
 }
 
@@ -123,19 +131,25 @@ pub fn write_agi<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuiseiResult
 /// # Errors
 /// Returns an error if writing to the output stream fails.
 pub fn write_pass_log<W: Write>(writer: &mut W, pass_decisions: &[bool]) -> SCuiseiResult<()> {
-    let mut pass_formatter = formatter::ScxvidPassFormatter::new(writer)
-        .map_err(|error| SCuiseiError::io_with("failed to write scxvid header", &error))?;
-    for (index, is_cut) in pass_decisions.iter().copied().enumerate() {
-        if index == 0 {
+    let mut writer = std::io::BufWriter::new(writer);
+    {
+        let mut pass_formatter = formatter::ScxvidPassFormatter::new(&mut writer)
+            .map_err(|error| SCuiseiError::io_with("failed to write scxvid header", &error))?;
+        for (index, is_cut) in pass_decisions.iter().copied().enumerate() {
+            if index == 0 {
+                pass_formatter.write_first_frame().map_err(|error| {
+                    SCuiseiError::io_with("failed to write first frame", &error)
+                })?;
+                continue;
+            }
             pass_formatter
-                .write_first_frame()
-                .map_err(|error| SCuiseiError::io_with("failed to write first frame", &error))?;
-            continue;
+                .write_frame(is_cut)
+                .map_err(|error| SCuiseiError::io_with("failed to write frame decision", &error))?;
         }
-        pass_formatter
-            .write_frame(is_cut)
-            .map_err(|error| SCuiseiError::io_with("failed to write frame decision", &error))?;
     }
+    writer
+        .flush()
+        .map_err(|error| SCuiseiError::io_with("failed to flush scxvid output", &error))?;
     Ok(())
 }
 
