@@ -106,18 +106,18 @@ pub fn write_agi<W: Write>(writer: &mut W, keyframes: &[usize]) -> SCuiseiResult
 /// # Errors
 /// Returns an error if writing to the output stream fails.
 pub fn write_pass_log<W: Write>(writer: &mut W, pass_decisions: &[bool]) -> SCuiseiResult<()> {
-    let mut pass_formatter =
-        formatter::ScxvidPassFormatter::new(writer).map_err(SCuiseiError::from)?;
+    let mut pass_formatter = formatter::ScxvidPassFormatter::new(writer)
+        .map_err(|error| SCuiseiError::io_with("failed to write scxvid header", &error))?;
     for (index, is_cut) in pass_decisions.iter().copied().enumerate() {
         if index == 0 {
             pass_formatter
                 .write_first_frame()
-                .map_err(SCuiseiError::from)?;
+                .map_err(|error| SCuiseiError::io_with("failed to write first frame", &error))?;
             continue;
         }
         pass_formatter
             .write_frame(is_cut)
-            .map_err(SCuiseiError::from)?;
+            .map_err(|error| SCuiseiError::io_with("failed to write frame decision", &error))?;
     }
     Ok(())
 }

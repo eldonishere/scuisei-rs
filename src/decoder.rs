@@ -1,4 +1,5 @@
-use anyhow::{Context as _, Result};
+use crate::{SCuiseiError, SCuiseiResult};
+use anyhow::{Context as _, Result as AnyResult};
 use ffmpeg::format::Pixel;
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as ScalingContext, flag::Flags as ScalingFlags};
@@ -39,7 +40,7 @@ fn enable_hwdec(
     ctx: &mut ffmpeg::codec::context::Context,
     codec: ffmpeg::Codec,
     device_type: ffmpeg::ffi::AVHWDeviceType,
-) -> Result<Box<HwCtx>> {
+) -> AnyResult<Box<HwCtx>> {
     unsafe {
         let codec = codec.as_ptr();
         let avctx = ctx.as_mut_ptr();
@@ -132,35 +133,41 @@ impl DecodeFrameBuffers {
 }
 
 impl Decoder {
-    pub fn open(path: &Path, hwdev: Option<&str>) -> Result<Self> {
-        let ictx = ffmpeg::format::input(path)
-            .with_context(|| format!("failed to open input: {}", path.display()))?;
+    pub fn open(path: &Path, hwdev: Option<&str>) -> SCuiseiResult<Self> {
+        let ictx = ffmpeg::format::input(path).map_err(|error| {
+            SCuiseiError::io_message(format!("failed to open input: {}: {error}", path.display()))
+        })?;
 
         let input = ictx
             .streams()
             .best(Type::Video)
-            .context("no video stream found")?;
+            .ok_or_else(|| SCuiseiError::unsupported("no video stream found"))?;
         let video_stream_index = input.index();
 
-        let mut context_decoder =
-            ffmpeg::codec::context::Context::from_parameters(input.parameters())
-                .context("failed to create decoder context")?;
+        let mut context_decoder = ffmpeg::codec::context::Context::from_parameters(
+            input.parameters(),
+        )
+        .map_err(|error| SCuiseiError::decode_with("failed to create decoder context", &error))?;
         let codec = ffmpeg::codec::decoder::find(context_decoder.id())
-            .context("failed to find video decoder")?;
+            .ok_or_else(|| SCuiseiError::unsupported("failed to find video decoder"))?;
         configure_decoder_threading(&mut context_decoder);
         let hw = hwdev
             .map(|name| {
                 let ty = parse_hw_device_type(name)?;
-                enable_hwdec(&mut context_decoder, codec, ty)
-                    .with_context(|| format!("failed to enable hardware decoding (--hwdec {name})"))
+                enable_hwdec(&mut context_decoder, codec, ty).map_err(|error| {
+                    SCuiseiError::unsupported_with(
+                        &format!("failed to enable hardware decoding (--hwdec {name})"),
+                        &error,
+                    )
+                })
             })
             .transpose()?;
         let video = context_decoder
             .decoder()
             .open_as(codec)
-            .context("failed to open video decoder")?
+            .map_err(|error| SCuiseiError::decode_with("failed to open video decoder", &error))?
             .video()
-            .context("failed to open video decoder")?;
+            .map_err(|error| SCuiseiError::decode_with("failed to open video decoder", &error))?;
 
         Ok(Self {
             ictx,
@@ -172,9 +179,9 @@ impl Decoder {
         })
     }
 
-    pub fn decode_luma_frames<F>(&mut self, mut on_frame: F) -> Result<()>
+    pub fn decode_luma_frames<F>(&mut self, mut on_frame: F) -> SCuiseiResult<()>
     where
-        F: FnMut(&mut Vec<u8>, FrameInfo) -> Result<()>,
+        F: FnMut(&mut Vec<u8>, FrameInfo) -> SCuiseiResult<()>,
     {
         let mut buffers = DecodeFrameBuffers::new();
 
@@ -182,9 +189,9 @@ impl Decoder {
             if stream.index() != self.video_stream_index {
                 continue;
             }
-            self.video
-                .send_packet(&packet)
-                .context("failed to send packet to decoder")?;
+            self.video.send_packet(&packet).map_err(|error| {
+                SCuiseiError::decode_with("failed to send packet to decoder", &error)
+            })?;
             receive_and_process_frames(
                 &mut self.video,
                 &mut self.scaler,
@@ -195,9 +202,9 @@ impl Decoder {
             )?;
         }
 
-        self.video
-            .send_eof()
-            .context("failed to signal EOF to decoder")?;
+        self.video.send_eof().map_err(|error| {
+            SCuiseiError::decode_with("failed to signal EOF to decoder", &error)
+        })?;
         receive_and_process_frames(
             &mut self.video,
             &mut self.scaler,
@@ -211,12 +218,13 @@ impl Decoder {
     }
 }
 
-fn parse_hw_device_type(name: &str) -> Result<ffmpeg::ffi::AVHWDeviceType> {
+fn parse_hw_device_type(name: &str) -> SCuiseiResult<ffmpeg::ffi::AVHWDeviceType> {
     let raw = name;
-    let name = std::ffi::CString::new(raw).context("invalid --hwdec value")?;
+    let name = std::ffi::CString::new(raw)
+        .map_err(|error| SCuiseiError::config_with("invalid --hwdec value", &error))?;
     let ty = unsafe { ffmpeg::ffi::av_hwdevice_find_type_by_name(name.as_ptr().cast::<c_char>()) };
     if ty == ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
-        anyhow::bail!("unknown --hwdec: {raw}");
+        return Err(SCuiseiError::config(format!("unknown --hwdec: {raw}")));
     }
     Ok(ty)
 }
@@ -228,9 +236,9 @@ fn receive_and_process_frames<F>(
     buffers: &mut DecodeFrameBuffers,
     require_hw: bool,
     on_frame: &mut F,
-) -> Result<()>
+) -> SCuiseiResult<()>
 where
-    F: FnMut(&mut Vec<u8>, FrameInfo) -> Result<()>,
+    F: FnMut(&mut Vec<u8>, FrameInfo) -> SCuiseiResult<()>,
 {
     loop {
         match decoder.receive_frame(&mut buffers.decoded) {
@@ -242,12 +250,16 @@ where
                 break;
             }
             Err(ffmpeg::Error::Eof) => break,
-            Err(e) => return Err(anyhow::Error::new(e)).context("failed to receive frame"),
+            Err(error) => {
+                return Err(SCuiseiError::decode_with("failed to receive frame", &error));
+            }
         }
 
         let is_hw = unsafe { !(*buffers.decoded.as_ptr()).hw_frames_ctx.is_null() };
         if require_hw && !is_hw {
-            anyhow::bail!("--hwdec set but decoder produced software frames");
+            return Err(SCuiseiError::unsupported(
+                "--hwdec set but decoder produced software frames",
+            ));
         }
         let frame: &Video = if is_hw {
             unsafe {
@@ -258,7 +270,7 @@ where
                     0,
                 );
                 if rc < 0 {
-                    anyhow::bail!("failed to transfer hardware frame");
+                    return Err(SCuiseiError::decode("failed to transfer hardware frame"));
                 }
             }
             &buffers.transferred
@@ -272,11 +284,12 @@ where
         };
 
         if is_direct_luma_format(frame.format()) {
-            copy_luma_plane(frame, &mut buffers.luma).context("failed to copy luma plane")?;
+            copy_luma_plane(frame, &mut buffers.luma).map_err(|error| decode_anyhow(&error))?;
         } else {
-            scale_to_gray8(scaler, scaler_input, frame, &mut buffers.gray)?;
+            scale_to_gray8(scaler, scaler_input, frame, &mut buffers.gray)
+                .map_err(|error| decode_anyhow(&error))?;
             copy_luma_plane(&buffers.gray, &mut buffers.luma)
-                .context("failed to copy luma plane")?;
+                .map_err(|error| decode_anyhow(&error))?;
         }
 
         on_frame(&mut buffers.luma, info)?;
@@ -285,12 +298,16 @@ where
     Ok(())
 }
 
+fn decode_anyhow(error: &anyhow::Error) -> SCuiseiError {
+    SCuiseiError::decode(error.to_string())
+}
+
 fn scale_to_gray8(
     scaler: &mut Option<ScalingContext>,
     scaler_input: &mut Option<ScalerInput>,
     decoded: &Video,
     gray: &mut Video,
-) -> Result<()> {
+) -> AnyResult<()> {
     let current_input = ScalerInput {
         format: decoded.format(),
         width: decoded.width(),
@@ -327,7 +344,7 @@ fn ensure_gray8_scaler<'a>(
     scaler_input: &mut Option<ScalerInput>,
     gray: &mut Video,
     current_input: ScalerInput,
-) -> Result<&'a mut ScalingContext> {
+) -> AnyResult<&'a mut ScalingContext> {
     if scaler.is_none()
         || scaler_input
             .as_ref()
@@ -346,7 +363,7 @@ fn ensure_gray8_scaler<'a>(
     scaler.as_mut().context("scaler unexpectedly missing")
 }
 
-fn create_gray8_scaler(input: ScalerInput) -> Result<ScalingContext> {
+fn create_gray8_scaler(input: ScalerInput) -> AnyResult<ScalingContext> {
     ScalingContext::get(
         input.format,
         input.width,
@@ -377,7 +394,7 @@ fn is_direct_luma_format(format: Pixel) -> bool {
     )
 }
 
-fn copy_luma_plane(frame: &Video, out: &mut Vec<u8>) -> Result<()> {
+fn copy_luma_plane(frame: &Video, out: &mut Vec<u8>) -> AnyResult<()> {
     let width = frame.width() as usize;
     let height = frame.height() as usize;
     let stride = frame.stride(0);

@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use thiserror::Error;
 
 /// Public error type for `scuisei-rs` library and CLI operations.
@@ -18,6 +19,31 @@ pub enum SCuiseiError {
 pub type SCuiseiResult<T> = std::result::Result<T, SCuiseiError>;
 
 impl SCuiseiError {
+    #[must_use]
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::Config(message.into())
+    }
+
+    #[must_use]
+    pub fn io_message(message: impl Into<String>) -> Self {
+        Self::Io(message.into())
+    }
+
+    #[must_use]
+    pub fn decode(message: impl Into<String>) -> Self {
+        Self::Decode(message.into())
+    }
+
+    #[must_use]
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::Unsupported(message.into())
+    }
+
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+
     /// Return a stable category label for this error variant.
     #[must_use]
     pub fn category(&self) -> &'static str {
@@ -32,47 +58,42 @@ impl SCuiseiError {
 
     #[must_use]
     pub fn io(context: &str, error: &std::io::Error) -> Self {
-        Self::Io(format!("{context}: {error}"))
+        Self::io_with(context, error)
     }
 
-    fn classify(message: String) -> Self {
-        let lowered = message.to_ascii_lowercase();
+    #[must_use]
+    pub fn config_with(context: &str, error: &impl Display) -> Self {
+        Self::config(Self::contextual_message(context, error))
+    }
 
-        if lowered.contains("unknown --hwdec") || lowered.contains("invalid --hwdec") {
-            return Self::Config(message);
-        }
+    #[must_use]
+    pub fn io_with(context: &str, error: &impl Display) -> Self {
+        Self::io_message(Self::contextual_message(context, error))
+    }
 
-        if lowered.contains("failed to open input")
-            || lowered.contains("failed to create output file")
-            || lowered.contains("failed to flush output")
-        {
-            return Self::Io(message);
-        }
+    #[must_use]
+    pub fn decode_with(context: &str, error: &impl Display) -> Self {
+        Self::decode(Self::contextual_message(context, error))
+    }
 
-        if lowered.contains("hardware decoding")
-            || lowered.contains("no video stream found")
-            || lowered.contains("unsupported")
-        {
-            return Self::Unsupported(message);
-        }
+    #[must_use]
+    pub fn unsupported_with(context: &str, error: &impl Display) -> Self {
+        Self::unsupported(Self::contextual_message(context, error))
+    }
 
-        if lowered.contains("ffmpeg")
-            || lowered.contains("decoder")
-            || lowered.contains("frame")
-            || lowered.contains("luma")
-            || lowered.contains("scaler")
-            || lowered.contains("video")
-        {
-            return Self::Decode(message);
-        }
+    #[must_use]
+    pub fn internal_with(context: &str, error: &impl Display) -> Self {
+        Self::internal(Self::contextual_message(context, error))
+    }
 
-        Self::Internal(message)
+    fn contextual_message(context: &str, error: &impl Display) -> String {
+        format!("{context}: {error}")
     }
 }
 
 impl From<anyhow::Error> for SCuiseiError {
     fn from(value: anyhow::Error) -> Self {
-        Self::classify(value.to_string())
+        Self::internal(value.to_string())
     }
 }
 
@@ -81,15 +102,22 @@ mod tests {
     use super::SCuiseiError;
 
     #[test]
-    fn classifies_hwdec_as_config_error() {
-        let error = SCuiseiError::from(anyhow::anyhow!("unknown --hwdec: nope"));
-        assert!(matches!(error, SCuiseiError::Config(_)));
+    fn from_anyhow_defaults_to_internal_error() {
+        let error = SCuiseiError::from(anyhow::anyhow!("opaque failure"));
+        assert!(matches!(error, SCuiseiError::Internal(_)));
     }
 
     #[test]
-    fn classifies_input_open_as_io_error() {
-        let error = SCuiseiError::from(anyhow::anyhow!("failed to open input: foo.mp4"));
+    fn io_helper_preserves_io_category() {
+        let error = SCuiseiError::io_message("failed to open input: foo.mp4");
         assert!(matches!(error, SCuiseiError::Io(_)));
         assert_eq!(error.category(), "io");
+    }
+
+    #[test]
+    fn config_helper_preserves_config_category() {
+        let error = SCuiseiError::config("unknown --hwdec: nope");
+        assert!(matches!(error, SCuiseiError::Config(_)));
+        assert_eq!(error.category(), "config");
     }
 }

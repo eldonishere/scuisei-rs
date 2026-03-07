@@ -1,6 +1,5 @@
 use crate::{SCuiseiError, SCuiseiResult};
 use crate::{decoder, detector, postprocess, simd_metrics};
-use anyhow::{Context as _, Result as AnyResult};
 use std::path::PathBuf;
 
 const ADAPTIVE_PROMOTION_MIN_RATIO: f64 = 0.85;
@@ -254,11 +253,12 @@ fn dump_score_line(frame_index: usize, record: DetectionRecord) {
 /// Returns an error if `FFmpeg` initialization fails, the input cannot be decoded,
 /// or frame processing encounters an I/O/codec error.
 pub fn analyze_video(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult> {
-    analyze_video_impl(options).map_err(SCuiseiError::from)
+    analyze_video_impl(options)
 }
 
-fn analyze_video_impl(options: &AnalyzeOptions) -> AnyResult<AnalysisResult> {
-    ffmpeg_next::init().context("failed to initialize ffmpeg")?;
+fn analyze_video_impl(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult> {
+    ffmpeg_next::init()
+        .map_err(|error| SCuiseiError::decode_with("failed to initialize ffmpeg", &error))?;
 
     let mut xvid_detector = detector::XvidDetector::new(options.xvid_config);
     let mut adaptive_detector = detector::Detector::new(options.adaptive_config);
