@@ -170,13 +170,19 @@ impl DetectorConfig {
 pub struct Detector {
     config: DetectorConfig,
     window: VecDeque<f64>,
+    scratch: Vec<f64>,
 }
 
 impl Detector {
     #[must_use]
     pub fn new(config: DetectorConfig) -> Self {
         let window = VecDeque::with_capacity(config.window_size);
-        Self { config, window }
+        let scratch = Vec::with_capacity(config.window_size);
+        Self {
+            config,
+            window,
+            scratch,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -184,22 +190,24 @@ impl Detector {
     }
 
     #[must_use]
-    pub fn threshold(&self) -> f64 {
+    pub fn threshold(&mut self) -> f64 {
         if self.window.len() < MIN_SAMPLES_FOR_ADAPTIVE_THRESHOLD {
             return self.config.base_threshold;
         }
 
-        let mut values: Vec<f64> = self.window.iter().copied().collect();
-        values.sort_by(f64::total_cmp);
+        self.scratch.clear();
+        self.scratch.extend(self.window.iter().copied());
 
-        let len = values.len();
+        let len = self.scratch.len();
         let trim = (len / 10).clamp(1, len / 4);
-        let start = trim;
-        let end = len.saturating_sub(trim);
-        let slice = &values[start..end];
-        if slice.len() < 2 {
+        let middle_len = len.saturating_sub(trim.saturating_mul(2));
+        if middle_len < 2 {
             return self.config.base_threshold;
         }
+
+        self.scratch.select_nth_unstable_by(trim, f64::total_cmp);
+        let rest = &mut self.scratch[trim..];
+        let (slice, _, _) = rest.select_nth_unstable_by(middle_len, f64::total_cmp);
 
         let n = usize_to_f64(slice.len());
         let mean = slice.iter().sum::<f64>() / n;
@@ -227,7 +235,7 @@ impl Detector {
     }
 
     #[must_use]
-    pub fn decide_with_threshold(&self, score: f64, hist_distance: f64) -> (bool, f64) {
+    pub fn decide_with_threshold(&mut self, score: f64, hist_distance: f64) -> (bool, f64) {
         let threshold = self.threshold();
         if score < self.config.min_score {
             return (false, threshold);
@@ -261,4 +269,64 @@ fn u64_to_f64(value: u64) -> f64 {
     let low_mask = u64::from(u32::MAX);
     let low = u32::try_from(value & low_mask).unwrap_or(u32::MAX);
     (f64::from(high) * TWO_POW_32_F64) + f64::from(low)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn baseline_threshold(config: DetectorConfig, values: &[f64]) -> f64 {
+        if values.len() < MIN_SAMPLES_FOR_ADAPTIVE_THRESHOLD {
+            return config.base_threshold;
+        }
+
+        let mut values = values.to_vec();
+        values.sort_by(f64::total_cmp);
+
+        let len = values.len();
+        let trim = (len / 10).clamp(1, len / 4);
+        let slice = &values[trim..len.saturating_sub(trim)];
+        if slice.len() < 2 {
+            return config.base_threshold;
+        }
+
+        let n = usize_to_f64(slice.len());
+        let mean = slice.iter().sum::<f64>() / n;
+        let mut var = slice
+            .iter()
+            .map(|value| (value - mean) * (value - mean))
+            .sum::<f64>()
+            / n;
+        if var.is_sign_negative() {
+            var = 0.0;
+        }
+        let stddev = var.sqrt();
+        (mean + (config.sigma * stddev)).max(config.base_threshold)
+    }
+
+    proptest! {
+        #[test]
+        fn threshold_matches_sorted_baseline(
+            window_size in 5_usize..64,
+            sigma in 0.0_f64..8.0_f64,
+            base_threshold in 0.0_f64..1.0_f64,
+            values in prop::collection::vec(0.0_f64..1.0_f64, 0..128),
+        ) {
+            let config = DetectorConfig {
+                window_size,
+                sigma,
+                base_threshold,
+                ..DetectorConfig::default()
+            };
+            let mut detector = Detector::new(config);
+            for value in values.iter().copied() {
+                detector.observe(value);
+            }
+
+            let expected = baseline_threshold(config, &detector.window.iter().copied().collect::<Vec<_>>());
+            let actual = detector.threshold();
+            prop_assert!((actual - expected).abs() < 1e-12);
+        }
+    }
 }
