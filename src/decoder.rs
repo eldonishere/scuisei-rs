@@ -7,81 +7,128 @@ use ffmpeg::util::frame::video::Video;
 use ffmpeg_next as ffmpeg;
 use std::ffi::c_char;
 use std::path::Path;
-use std::ptr;
 
-struct HwCtx {
-    pix_fmt: ffmpeg::ffi::AVPixelFormat,
-}
+mod hwaccel {
+    use super::{AnyResult, SCuiseiError, SCuiseiResult, Video, ffmpeg};
+    use std::ptr;
 
-unsafe extern "C" fn get_hw_format(
-    s: *mut ffmpeg::ffi::AVCodecContext,
-    fmt: *const ffmpeg::ffi::AVPixelFormat,
-) -> ffmpeg::ffi::AVPixelFormat {
-    let hw = unsafe { (*s).opaque as *const HwCtx };
-    if hw.is_null() {
-        return ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
-    }
-    let desired = unsafe { (*hw).pix_fmt };
-
-    let mut p = fmt;
-    loop {
-        let v = unsafe { *p };
-        if v == desired {
-            return v;
-        }
-        if v == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-            return v;
-        }
-        p = unsafe { p.add(1) };
-    }
-}
-
-fn enable_hwdec(
-    ctx: &mut ffmpeg::codec::context::Context,
-    codec: ffmpeg::Codec,
-    device_type: ffmpeg::ffi::AVHWDeviceType,
-) -> AnyResult<Box<HwCtx>> {
-    unsafe {
-        let codec = codec.as_ptr();
-        let avctx = ctx.as_mut_ptr();
-
-        for i in 0_i32.. {
-            let cfg = ffmpeg::ffi::avcodec_get_hw_config(codec, i);
-            if cfg.is_null() {
-                break;
-            }
-            if ((*cfg).methods & (ffmpeg::ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32)) == 0
-            {
-                continue;
-            }
-            if (*cfg).device_type != device_type {
-                continue;
-            }
-
-            let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = ptr::null_mut();
-            if ffmpeg::ffi::av_hwdevice_ctx_create(
-                &raw mut device_ctx,
-                (*cfg).device_type,
-                ptr::null(),
-                ptr::null_mut(),
-                0,
-            ) < 0
-            {
-                continue;
-            }
-
-            (*avctx).hw_device_ctx = device_ctx;
-            (*avctx).get_format = Some(get_hw_format);
-
-            let hw = Box::new(HwCtx {
-                pix_fmt: (*cfg).pix_fmt,
-            });
-            (*avctx).opaque = std::ptr::from_ref::<HwCtx>(hw.as_ref()) as *mut _;
-            return Ok(hw);
-        }
+    struct HwCtx {
+        pix_fmt: ffmpeg::ffi::AVPixelFormat,
     }
 
-    anyhow::bail!("failed to enable hardware decoding")
+    /// Hardware-decoder state pinned beside the `FFmpeg` decoder context.
+    ///
+    /// Safety invariants:
+    /// - `selector` must outlive the `AVCodecContext` `opaque` pointer that references it.
+    /// - `get_hw_format` may only read `selector`; it must not mutate or free FFmpeg-owned memory.
+    /// - `transfer_to_cpu` always unrefs `transferred` before asking `FFmpeg` to write into it.
+    pub(super) struct Binding {
+        selector: Box<HwCtx>,
+    }
+
+    impl Binding {
+        pub(super) fn attach(
+            ctx: &mut ffmpeg::codec::context::Context,
+            codec: ffmpeg::Codec,
+            device_type: ffmpeg::ffi::AVHWDeviceType,
+        ) -> AnyResult<Self> {
+            unsafe {
+                let codec = codec.as_ptr();
+                let avctx = ctx.as_mut_ptr();
+
+                for i in 0_i32.. {
+                    let cfg = ffmpeg::ffi::avcodec_get_hw_config(codec, i);
+                    if cfg.is_null() {
+                        break;
+                    }
+                    if ((*cfg).methods
+                        & (ffmpeg::ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32))
+                        == 0
+                    {
+                        continue;
+                    }
+                    if (*cfg).device_type != device_type {
+                        continue;
+                    }
+
+                    let mut device_ctx: *mut ffmpeg::ffi::AVBufferRef = ptr::null_mut();
+                    if ffmpeg::ffi::av_hwdevice_ctx_create(
+                        &raw mut device_ctx,
+                        (*cfg).device_type,
+                        ptr::null(),
+                        ptr::null_mut(),
+                        0,
+                    ) < 0
+                    {
+                        continue;
+                    }
+
+                    (*avctx).hw_device_ctx = device_ctx;
+                    (*avctx).get_format = Some(get_hw_format);
+
+                    let selector = Box::new(HwCtx {
+                        pix_fmt: (*cfg).pix_fmt,
+                    });
+                    (*avctx).opaque = std::ptr::from_ref::<HwCtx>(selector.as_ref()) as *mut _;
+                    return Ok(Self { selector });
+                }
+            }
+
+            anyhow::bail!("failed to enable hardware decoding")
+        }
+
+        #[must_use]
+        pub(super) fn is_hardware_frame(frame: &Video) -> bool {
+            unsafe { !(*frame.as_ptr()).hw_frames_ctx.is_null() }
+        }
+
+        pub(super) fn transfer_to_cpu(
+            decoded: &Video,
+            transferred: &mut Video,
+        ) -> SCuiseiResult<()> {
+            unsafe {
+                ffmpeg::ffi::av_frame_unref(transferred.as_mut_ptr());
+                let rc = ffmpeg::ffi::av_hwframe_transfer_data(
+                    transferred.as_mut_ptr(),
+                    decoded.as_ptr(),
+                    0,
+                );
+                if rc < 0 {
+                    return Err(SCuiseiError::decode("failed to transfer hardware frame"));
+                }
+            }
+
+            Ok(())
+        }
+
+        #[must_use]
+        pub(super) fn pixel_format(&self) -> ffmpeg::ffi::AVPixelFormat {
+            self.selector.pix_fmt
+        }
+    }
+
+    unsafe extern "C" fn get_hw_format(
+        s: *mut ffmpeg::ffi::AVCodecContext,
+        fmt: *const ffmpeg::ffi::AVPixelFormat,
+    ) -> ffmpeg::ffi::AVPixelFormat {
+        let selector = unsafe { (*s).opaque as *const HwCtx };
+        if selector.is_null() {
+            return ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+        }
+        let desired = unsafe { (*selector).pix_fmt };
+
+        let mut p = fmt;
+        loop {
+            let value = unsafe { *p };
+            if value == desired {
+                return value;
+            }
+            if value == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                return value;
+            }
+            p = unsafe { p.add(1) };
+        }
+    }
 }
 
 fn configure_decoder_threading(ctx: &mut ffmpeg::codec::context::Context) {
@@ -104,7 +151,7 @@ pub struct Decoder {
     video: ffmpeg::decoder::Video,
     scaler: Option<ScalingContext>,
     scaler_input: Option<ScalerInput>,
-    hw: Option<Box<HwCtx>>,
+    hw: Option<hwaccel::Binding>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,14 +199,20 @@ impl Decoder {
             .ok_or_else(|| SCuiseiError::unsupported("failed to find video decoder"))?;
         configure_decoder_threading(&mut context_decoder);
         let hw = hwdev
-            .map(|name| {
+            .map(|name| -> SCuiseiResult<hwaccel::Binding> {
                 let ty = parse_hw_device_type(name)?;
-                enable_hwdec(&mut context_decoder, codec, ty).map_err(|error| {
-                    SCuiseiError::unsupported_with(
-                        &format!("failed to enable hardware decoding (--hwdec {name})"),
-                        &error,
-                    )
-                })
+                let binding =
+                    hwaccel::Binding::attach(&mut context_decoder, codec, ty).map_err(|error| {
+                        SCuiseiError::unsupported_with(
+                            &format!("failed to enable hardware decoding (--hwdec {name})"),
+                            &error,
+                        )
+                    })?;
+                debug_assert_ne!(
+                    binding.pixel_format(),
+                    ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE
+                );
+                Ok(binding)
             })
             .transpose()?;
         let video = context_decoder
@@ -255,24 +308,10 @@ where
             }
         }
 
-        let is_hw = unsafe { !(*buffers.decoded.as_ptr()).hw_frames_ctx.is_null() };
-        if require_hw && !is_hw {
-            return Err(SCuiseiError::unsupported(
-                "--hwdec set but decoder produced software frames",
-            ));
-        }
+        let is_hw = hwaccel::Binding::is_hardware_frame(&buffers.decoded);
+        validate_hw_frame_requirement(require_hw, is_hw)?;
         let frame: &Video = if is_hw {
-            unsafe {
-                ffmpeg::ffi::av_frame_unref(buffers.transferred.as_mut_ptr());
-                let rc = ffmpeg::ffi::av_hwframe_transfer_data(
-                    buffers.transferred.as_mut_ptr(),
-                    buffers.decoded.as_ptr(),
-                    0,
-                );
-                if rc < 0 {
-                    return Err(SCuiseiError::decode("failed to transfer hardware frame"));
-                }
-            }
+            hwaccel::Binding::transfer_to_cpu(&buffers.decoded, &mut buffers.transferred)?;
             &buffers.transferred
         } else {
             &buffers.decoded
@@ -300,6 +339,16 @@ where
 
 fn decode_anyhow(error: &anyhow::Error) -> SCuiseiError {
     SCuiseiError::decode(error.to_string())
+}
+
+fn validate_hw_frame_requirement(require_hw: bool, is_hw: bool) -> SCuiseiResult<()> {
+    if require_hw && !is_hw {
+        return Err(SCuiseiError::unsupported(
+            "--hwdec set but decoder produced software frames",
+        ));
+    }
+
+    Ok(())
 }
 
 fn scale_to_gray8(
@@ -442,4 +491,35 @@ fn copy_luma_plane(frame: &Video, out: &mut Vec<u8>) -> AnyResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_hw_device_type, validate_hw_frame_requirement};
+    use crate::SCuiseiError;
+
+    #[test]
+    fn invalid_hwdec_name_is_config_error() {
+        let error = parse_hw_device_type("not-a-device").expect_err("invalid device should fail");
+        assert!(matches!(error, SCuiseiError::Config(_)));
+    }
+
+    #[test]
+    fn nul_in_hwdec_name_is_config_error() {
+        let error = parse_hw_device_type("bad\0device").expect_err("nul device should fail");
+        assert!(matches!(error, SCuiseiError::Config(_)));
+    }
+
+    #[test]
+    fn requiring_hw_frames_rejects_software_output() {
+        let error = validate_hw_frame_requirement(true, false)
+            .expect_err("software frames should be rejected when --hwdec is required");
+        assert!(matches!(error, SCuiseiError::Unsupported(_)));
+    }
+
+    #[test]
+    fn software_frames_are_allowed_without_hw_requirement() {
+        assert!(validate_hw_frame_requirement(false, false).is_ok());
+        assert!(validate_hw_frame_requirement(true, true).is_ok());
+    }
 }

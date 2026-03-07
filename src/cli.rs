@@ -115,7 +115,8 @@ pub struct Cli {
     #[arg(long, value_parser = parse_nonnegative_f64, default_value_t = DEFAULT_ME_INTRA_THRESH2)]
     pub me_intra_thresh2: f64,
 
-    /// Require hardware decoding (no software fallback), e.g. vaapi/qsv/cuda
+    /// Require hardware decoding (no software fallback), e.g. vaapi/qsv/cuda.
+    /// Frames are still transferred back to CPU memory for analysis, so end-to-end speedups vary.
     #[arg(long, value_name = "HWDEV")]
     pub hwdec: Option<String>,
 }

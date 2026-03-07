@@ -29,6 +29,8 @@ $ ./scuisei-rs -i input.mp4 --format frames
 $ ./scuisei-rs -i input.mp4 --native-res # slow - and default thresholds are tuned for the downsampled clip
 ```
 
+`--hwdec` keeps decode on the requested device when possible, but frames are still transferred back to CPU memory for analysis, so end-to-end speedups depend on the input and hardware stack.
+
 ## API (Rust)
 
 ```rust
