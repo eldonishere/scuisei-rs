@@ -69,6 +69,67 @@ struct CurrentFrame<'a> {
     snapshot: CurrentFrameSnapshot,
 }
 
+#[derive(Debug)]
+struct WorkingFramePlan {
+    source_dims: (usize, usize),
+    downscale_plan: simd_metrics::DownscalePlan,
+    grid_hist_plan: simd_metrics::GridHistogramPlan,
+}
+
+#[derive(Debug)]
+struct FramePreparationCache {
+    native_grid_plan: Option<simd_metrics::GridHistogramPlan>,
+    working_plan: Option<WorkingFramePlan>,
+}
+
+impl FramePreparationCache {
+    fn new() -> Self {
+        Self {
+            native_grid_plan: None,
+            working_plan: None,
+        }
+    }
+
+    fn native_grid_plan(
+        &mut self,
+        width: usize,
+        height: usize,
+    ) -> &simd_metrics::GridHistogramPlan {
+        if self
+            .native_grid_plan
+            .as_ref()
+            .is_none_or(|plan| plan.dimensions() != (width, height))
+        {
+            self.native_grid_plan = Some(simd_metrics::GridHistogramPlan::new(width, height));
+        }
+
+        self.native_grid_plan
+            .as_ref()
+            .expect("native grid plan must exist")
+    }
+
+    fn working_plan(&mut self, width: usize, height: usize) -> &WorkingFramePlan {
+        if self
+            .working_plan
+            .as_ref()
+            .is_none_or(|plan| plan.source_dims != (width, height))
+        {
+            let (work_w, work_h) = compute_downscale_dims(width, height);
+            let downscale_plan = simd_metrics::DownscalePlan::new(width, height, work_w, work_h);
+            let grid_hist_plan = simd_metrics::GridHistogramPlan::new(work_w, work_h);
+            self.working_plan = Some(WorkingFramePlan {
+                source_dims: (width, height),
+                downscale_plan,
+                grid_hist_plan,
+            });
+        }
+
+        self.working_plan
+            .as_ref()
+            .expect("working frame plan must exist")
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DetectionRecord {
     is_cut: bool,
@@ -155,10 +216,11 @@ fn prepare_working_luma(
     width: usize,
     height: usize,
     working_luma: &mut Vec<u8>,
+    cache: &mut FramePreparationCache,
 ) -> (usize, usize) {
-    let (work_w, work_h) = compute_downscale_dims(width, height);
-    simd_metrics::downscale_gray8_nearest(curr_luma, width, height, work_w, work_h, working_luma);
-    (work_w, work_h)
+    let working_plan = cache.working_plan(width, height);
+    working_plan.downscale_plan.run(curr_luma, working_luma);
+    working_plan.downscale_plan.dst_dimensions()
 }
 
 fn prepare_current_frame<'a>(
@@ -166,19 +228,33 @@ fn prepare_current_frame<'a>(
     info: decoder::FrameInfo,
     native_res: bool,
     curr_small: &'a mut Vec<u8>,
+    cache: &mut FramePreparationCache,
 ) -> CurrentFrame<'a> {
-    let (width, height, pixels): (usize, usize, &[u8]) = if native_res {
-        (info.width, info.height, curr_luma)
+    let (width, height, pixels, grid_hist): (
+        usize,
+        usize,
+        &[u8],
+        [u32; simd_metrics::GRID_HIST_LEN],
+    ) = if native_res {
+        let grid_hist = cache
+            .native_grid_plan(info.width, info.height)
+            .run(curr_luma);
+        (info.width, info.height, curr_luma, grid_hist)
     } else {
-        let (work_w, work_h) = prepare_working_luma(curr_luma, info.width, info.height, curr_small);
-        (work_w, work_h, curr_small.as_slice())
+        let (work_w, work_h) =
+            prepare_working_luma(curr_luma, info.width, info.height, curr_small, cache);
+        let grid_hist = cache
+            .working_plan(info.width, info.height)
+            .grid_hist_plan
+            .run(curr_small);
+        (work_w, work_h, curr_small.as_slice(), grid_hist)
     };
 
     let snapshot = CurrentFrameSnapshot {
         width,
         height,
         hist: simd_metrics::histogram_16(pixels),
-        grid_hist: simd_metrics::grid_histogram_16(pixels, width, height),
+        grid_hist,
     };
     CurrentFrame { pixels, snapshot }
 }
@@ -306,6 +382,7 @@ fn analyze_video_impl(
     let mut adaptive_detector = detector::Detector::new(options.adaptive_config);
     let mut state = DetectionState::new();
     let mut curr_small: Vec<u8> = Vec::new();
+    let mut frame_preparation_cache = FramePreparationCache::new();
     let mut frame_stats: Vec<postprocess::FrameCutStats> = if target.needs_keyframes() {
         Vec::new()
     } else {
@@ -319,8 +396,13 @@ fn analyze_video_impl(
 
     decoder::Decoder::open(&options.input, options.hwdec.as_deref())?.decode_luma_frames(
         |curr_luma, info| {
-            let current =
-                prepare_current_frame(curr_luma, info, options.native_res, &mut curr_small);
+            let current = prepare_current_frame(
+                curr_luma,
+                info,
+                options.native_res,
+                &mut curr_small,
+                &mut frame_preparation_cache,
+            );
             let snapshot = current.snapshot;
 
             if state.is_first_frame() {

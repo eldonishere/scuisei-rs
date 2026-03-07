@@ -5,6 +5,124 @@ pub const GRID_HIST_X: usize = 4;
 pub const GRID_HIST_Y: usize = 4;
 pub const GRID_HIST_LEN: usize = 16 * GRID_HIST_X * GRID_HIST_Y;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownscalePlan {
+    dst_width: usize,
+    dst_height: usize,
+    x_indices: Vec<usize>,
+    src_row_offsets: Vec<usize>,
+}
+
+impl DownscalePlan {
+    #[must_use]
+    pub fn new(src_width: usize, src_height: usize, dst_width: usize, dst_height: usize) -> Self {
+        let x_indices = if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+            Vec::new()
+        } else {
+            (0..dst_width)
+                .map(|x_out| x_out.saturating_mul(src_width) / dst_width)
+                .collect()
+        };
+        let src_row_offsets =
+            if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+                Vec::new()
+            } else {
+                (0..dst_height)
+                    .map(|y_out| {
+                        let y_in = y_out.saturating_mul(src_height) / dst_height;
+                        y_in.saturating_mul(src_width)
+                    })
+                    .collect()
+            };
+
+        Self {
+            dst_width,
+            dst_height,
+            x_indices,
+            src_row_offsets,
+        }
+    }
+
+    #[must_use]
+    pub fn dst_dimensions(&self) -> (usize, usize) {
+        (self.dst_width, self.dst_height)
+    }
+
+    pub fn run(&self, src: &[u8], dst: &mut Vec<u8>) {
+        if self.dst_width == 0 || self.dst_height == 0 {
+            dst.clear();
+            return;
+        }
+
+        let needed = self.dst_width.saturating_mul(self.dst_height);
+        dst.resize(needed, 0);
+
+        for (y_out, row_in) in self.src_row_offsets.iter().copied().enumerate() {
+            let row_out = y_out.saturating_mul(self.dst_width);
+            for (x_out, x_in) in self.x_indices.iter().copied().enumerate() {
+                dst[row_out + x_out] = src[row_in + x_in];
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GridHistogramPlan {
+    width: usize,
+    row_cell_bases: Vec<usize>,
+    x_cell_offsets: Vec<usize>,
+}
+
+impl GridHistogramPlan {
+    #[must_use]
+    pub fn new(width: usize, height: usize) -> Self {
+        let x_cell_offsets = if width == 0 || height == 0 {
+            Vec::new()
+        } else {
+            (0..width)
+                .map(|x| ((x * GRID_HIST_X) / width).saturating_mul(16))
+                .collect()
+        };
+        let row_cell_bases = if width == 0 || height == 0 {
+            Vec::new()
+        } else {
+            (0..height)
+                .map(|y| ((y * GRID_HIST_Y) / height).saturating_mul(GRID_HIST_X * 16))
+                .collect()
+        };
+
+        Self {
+            width,
+            row_cell_bases,
+            x_cell_offsets,
+        }
+    }
+
+    #[must_use]
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.row_cell_bases.len())
+    }
+
+    #[must_use]
+    pub fn run(&self, frame: &[u8]) -> [u32; GRID_HIST_LEN] {
+        let mut hist = [0_u32; GRID_HIST_LEN];
+        let height = self.row_cell_bases.len();
+        if self.width == 0 || height == 0 || frame.len() < self.width.saturating_mul(height) {
+            return hist;
+        }
+
+        for (y, row_cell_base) in self.row_cell_bases.iter().copied().enumerate() {
+            let row = y * self.width;
+            for (x, cell_offset) in self.x_cell_offsets.iter().copied().enumerate() {
+                let bin = usize::from(frame[row + x] >> 4);
+                hist[row_cell_base + cell_offset + bin] += 1;
+            }
+        }
+
+        hist
+    }
+}
+
 #[must_use]
 pub fn sad_u8(prev: &[u8], curr: &[u8]) -> u64 {
     if prev.len() != curr.len() {
@@ -91,51 +209,12 @@ pub fn downscale_gray8_nearest(
     dst_height: usize,
     dst: &mut Vec<u8>,
 ) {
-    if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
-        dst.clear();
-        return;
-    }
-
-    let needed = dst_width.saturating_mul(dst_height);
-    dst.resize(needed, 0);
-
-    let x_indices: Vec<usize> = (0..dst_width)
-        .map(|x_out| x_out.saturating_mul(src_width) / dst_width)
-        .collect();
-    let src_row_offsets: Vec<usize> = (0..dst_height)
-        .map(|y_out| {
-            let y_in = y_out.saturating_mul(src_height) / dst_height;
-            y_in.saturating_mul(src_width)
-        })
-        .collect();
-
-    for (y_out, row_in) in src_row_offsets.iter().copied().enumerate() {
-        let row_out = y_out.saturating_mul(dst_width);
-        for (x_out, x_in) in x_indices.iter().copied().enumerate() {
-            dst[row_out + x_out] = src[row_in + x_in];
-        }
-    }
+    DownscalePlan::new(src_width, src_height, dst_width, dst_height).run(src, dst);
 }
 
 #[must_use]
 pub fn grid_histogram_16(frame: &[u8], width: usize, height: usize) -> [u32; GRID_HIST_LEN] {
-    let mut hist = [0_u32; GRID_HIST_LEN];
-    if width == 0 || height == 0 || frame.len() < width.saturating_mul(height) {
-        return hist;
-    }
-
-    for y in 0..height {
-        let cell_y = (y * GRID_HIST_Y) / height;
-        let row = y * width;
-        for x in 0..width {
-            let cell_x = (x * GRID_HIST_X) / width;
-            let cell = (cell_y * GRID_HIST_X) + cell_x;
-            let bin = (frame[row + x] >> 4) as usize;
-            hist[(cell * 16) + bin] += 1;
-        }
-    }
-
-    hist
+    GridHistogramPlan::new(width, height).run(frame)
 }
 
 #[must_use]
@@ -878,6 +957,42 @@ mod tests {
         let curr = grid_histogram_16(&frame, width, height);
         let distance = grid_histogram_distance_16_from_hists(&prev, &curr, frame.len());
         assert!(distance.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn downscale_plan_matches_direct_path() {
+        let src_width: usize = 64;
+        let src_height: usize = 48;
+        let dst_width: usize = 17;
+        let dst_height: usize = 11;
+        let frame = make_frame(src_width * src_height, 3);
+
+        let mut direct = Vec::new();
+        downscale_gray8_nearest(
+            &frame,
+            src_width,
+            src_height,
+            dst_width,
+            dst_height,
+            &mut direct,
+        );
+
+        let mut planned = Vec::new();
+        DownscalePlan::new(src_width, src_height, dst_width, dst_height).run(&frame, &mut planned);
+
+        assert_eq!(planned, direct);
+    }
+
+    #[test]
+    fn grid_histogram_plan_matches_direct_path() {
+        let width: usize = 96;
+        let height: usize = 54;
+        let frame = make_frame(width * height, 11);
+
+        let direct = grid_histogram_16(&frame, width, height);
+        let planned = GridHistogramPlan::new(width, height).run(&frame);
+
+        assert_eq!(planned, direct);
     }
 
     #[test]
