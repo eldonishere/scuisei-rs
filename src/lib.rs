@@ -16,6 +16,7 @@ use crate::cli::OutputFormat;
 pub use analysis::{AnalysisResult, AnalyzeOptions, analyze_video};
 pub use detector::{DetectorConfig, XvidDetectorConfig};
 pub use error::{SCuiseiError, SCuiseiResult};
+pub use postprocess::PostprocessConfig;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -49,6 +50,7 @@ impl AnalyzeOptions {
             dump_scores,
             xvid_config: build_xvid_config(cli),
             adaptive_config: build_adaptive_config(cli),
+            postprocess_config: postprocess::PostprocessConfig::default(),
         }
     }
 
@@ -61,6 +63,7 @@ impl AnalyzeOptions {
             dump_scores: false,
             xvid_config: detector::XvidDetectorConfig::default(),
             adaptive_config: detector::DetectorConfig::default(),
+            postprocess_config: postprocess::PostprocessConfig::default(),
         }
     }
 }

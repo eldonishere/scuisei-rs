@@ -32,9 +32,10 @@ $ ./scuisei-rs -i input.mp4 --native-res # slow - and default thresholds are tun
 ## API (Rust)
 
 ```rust
-use scuisei_rs::{AnalyzeOptions, analyze_video};
+use scuisei_rs::{AnalyzeOptions, PostprocessConfig, analyze_video};
 
-let options = AnalyzeOptions::defaults_for_input("input.mp4");
+let mut options = AnalyzeOptions::defaults_for_input("input.mp4");
+options.postprocess_config = PostprocessConfig::default();
 let result = analyze_video(&options)?;
 println!("{:?}", result.keyframes);
 ```
@@ -47,6 +48,8 @@ println!("{:?}", result.keyframes);
 uvx maturin develop --features python
 uv run python -c "import scuisei_rs; print(scuisei_rs.detect_frames('input.mp4')); print(scuisei_rs.detect_pass('input.mp4'))"
 ```
+
+Python also exposes `scuisei_rs.PostprocessConfig()` for optional keyframe postprocess tuning.
 
 ## Release
 

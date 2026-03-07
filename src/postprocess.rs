@@ -1,27 +1,63 @@
-const HIST_BLEND_THRESHOLD: f64 = 0.10;
-const STRUCTURE_HIST_MAX: f64 = 0.05;
-const STRUCTURE_GRID_HIST_MIN: f64 = 0.22;
-const FRAMES_SCORE_MIN: f64 = 70.0;
-const CANDIDATE_PEAK_RADIUS: usize = 1;
-const CLUSTER_GAP_FRAMES: usize = 12;
-const MIN_POSTPROCESS_FRAMES: usize = 24;
-const DENSE_RECOVERY_MIN_GAP_FRAMES: usize = 24;
-const DENSE_RECOVERY_MIN_CANDIDATES: usize = 4;
-const DENSE_RECOVERY_MARGIN_FRAMES: usize = 12;
-const DENSE_RECOVERY_BLEND_MIN: f64 = 0.18;
-const DENSE_RECOVERY_SCORE_MIN: f64 = 80.0;
-const DENSE_RECOVERY_TARGET_SPAN_FRAMES: usize = 26;
-const TEMPORAL_BURST_WINDOW_FRAMES: usize = 12;
-const TEMPORAL_BURST_ACTIVITY_BLEND_MIN: f64 = 0.08;
-const TEMPORAL_BURST_MIN_COUNT: usize = 6;
-const TEMPORAL_BURST_RAW_HIST_MAX: f64 = 0.30;
-const TEMPORAL_BURST_RAW_SCORE_MAX: f64 = 120.0;
-const TEMPORAL_BURST_NONRAW_SCORE_MAX: f64 = 90.0;
-const TEMPORAL_BURST_NONRAW_BLEND_MAX: f64 = 0.20;
-const TEMPORAL_BURST_DENSE_MIN_COUNT: usize = 20;
-const TEMPORAL_BURST_DENSE_NONRAW_SCORE_MAX: f64 = 90.0;
-const TEMPORAL_BURST_CUT_FALLBACK_HIST_MAX: f64 = 0.20;
-const TEMPORAL_BURST_CUT_FALLBACK_SCORE_MIN: f64 = 120.0;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PostprocessConfig {
+    pub hist_blend_threshold: f64,
+    pub structure_hist_max: f64,
+    pub structure_grid_hist_min: f64,
+    pub frames_score_min: f64,
+    pub candidate_peak_radius: usize,
+    pub cluster_gap_frames: usize,
+    pub min_postprocess_frames: usize,
+    pub dense_recovery_min_gap_frames: usize,
+    pub dense_recovery_min_candidates: usize,
+    pub dense_recovery_margin_frames: usize,
+    pub dense_recovery_blend_min: f64,
+    pub dense_recovery_score_min: f64,
+    pub dense_recovery_target_span_frames: usize,
+    pub temporal_burst_window_frames: usize,
+    pub temporal_burst_activity_blend_min: f64,
+    pub temporal_burst_min_count: usize,
+    pub temporal_burst_raw_hist_max: f64,
+    pub temporal_burst_raw_score_max: f64,
+    pub temporal_burst_nonraw_score_max: f64,
+    pub temporal_burst_nonraw_blend_max: f64,
+    pub temporal_burst_dense_min_count: usize,
+    pub temporal_burst_dense_nonraw_score_max: f64,
+    pub temporal_burst_cut_fallback_hist_max: f64,
+    pub temporal_burst_cut_fallback_score_min: f64,
+    pub grid_hist_median_weight: f64,
+}
+
+impl Default for PostprocessConfig {
+    fn default() -> Self {
+        Self {
+            hist_blend_threshold: 0.10,
+            structure_hist_max: 0.05,
+            structure_grid_hist_min: 0.22,
+            frames_score_min: 70.0,
+            candidate_peak_radius: 1,
+            cluster_gap_frames: 12,
+            min_postprocess_frames: 24,
+            dense_recovery_min_gap_frames: 24,
+            dense_recovery_min_candidates: 4,
+            dense_recovery_margin_frames: 12,
+            dense_recovery_blend_min: 0.18,
+            dense_recovery_score_min: 80.0,
+            dense_recovery_target_span_frames: 26,
+            temporal_burst_window_frames: 12,
+            temporal_burst_activity_blend_min: 0.08,
+            temporal_burst_min_count: 6,
+            temporal_burst_raw_hist_max: 0.30,
+            temporal_burst_raw_score_max: 120.0,
+            temporal_burst_nonraw_score_max: 90.0,
+            temporal_burst_nonraw_blend_max: 0.20,
+            temporal_burst_dense_min_count: 20,
+            temporal_burst_dense_nonraw_score_max: 90.0,
+            temporal_burst_cut_fallback_hist_max: 0.20,
+            temporal_burst_cut_fallback_score_min: 120.0,
+            grid_hist_median_weight: 0.1,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct FrameCutStats {
@@ -55,50 +91,59 @@ fn is_local_peak(values: &[f64], index: usize, radius: usize) -> bool {
     true
 }
 
-fn initial_keyframes(stats: &[FrameCutStats]) -> Vec<usize> {
+fn initial_keyframes(stats: &[FrameCutStats], config: &PostprocessConfig) -> Vec<usize> {
     let mut baseline = vec![0_usize];
     baseline.extend(
         stats
             .iter()
-            .filter(|s| s.is_cut || s.hist_distance >= HIST_BLEND_THRESHOLD)
+            .filter(|s| s.is_cut || s.hist_distance >= config.hist_blend_threshold)
             .map(|s| s.frame_index),
     );
     baseline
 }
 
-fn build_blended_score(stats: &[FrameCutStats]) -> Vec<f64> {
+fn build_blended_score(stats: &[FrameCutStats], config: &PostprocessConfig) -> Vec<f64> {
     stats
         .iter()
-        .map(|s| s.hist_distance + (0.1 * s.grid_hist_median))
+        .map(|s| s.hist_distance + (config.grid_hist_median_weight * s.grid_hist_median))
         .collect()
 }
 
-fn burst_activity_prefix(blended: &[f64]) -> Vec<usize> {
+fn burst_activity_prefix(blended: &[f64], config: &PostprocessConfig) -> Vec<usize> {
     let mut prefix = vec![0; blended.len() + 1];
     for (index, value) in blended.iter().enumerate() {
         prefix[index + 1] =
-            prefix[index] + usize::from(*value >= TEMPORAL_BURST_ACTIVITY_BLEND_MIN);
+            prefix[index] + usize::from(*value >= config.temporal_burst_activity_blend_min);
     }
     prefix
 }
 
-fn burst_count_at_index(burst_prefix: &[usize], index: usize, len: usize) -> usize {
+fn burst_count_at_index(
+    burst_prefix: &[usize],
+    index: usize,
+    len: usize,
+    config: &PostprocessConfig,
+) -> usize {
     if len == 0 || index >= len {
         return 0;
     }
 
-    let burst_start = index.saturating_sub(TEMPORAL_BURST_WINDOW_FRAMES);
+    let burst_start = index.saturating_sub(config.temporal_burst_window_frames);
     let burst_end = index
-        .saturating_add(TEMPORAL_BURST_WINDOW_FRAMES)
+        .saturating_add(config.temporal_burst_window_frames)
         .min(len.saturating_sub(1));
     burst_prefix[burst_end + 1] - burst_prefix[burst_start]
 }
 
-fn is_cut_fallback_candidate(stat: &FrameCutStats, in_activity_burst: bool) -> bool {
+fn is_cut_fallback_candidate(
+    stat: &FrameCutStats,
+    in_activity_burst: bool,
+    config: &PostprocessConfig,
+) -> bool {
     stat.is_cut
         && in_activity_burst
-        && stat.score >= TEMPORAL_BURST_CUT_FALLBACK_SCORE_MIN
-        && stat.hist_distance <= TEMPORAL_BURST_CUT_FALLBACK_HIST_MAX
+        && stat.score >= config.temporal_burst_cut_fallback_score_min
+        && stat.hist_distance <= config.temporal_burst_cut_fallback_hist_max
 }
 
 fn collect_candidates(
@@ -106,23 +151,24 @@ fn collect_candidates(
     blended: &[f64],
     grid_hist: &[f64],
     burst_prefix: &[usize],
+    config: &PostprocessConfig,
 ) -> Vec<usize> {
     let mut candidates: Vec<usize> = Vec::new();
     for (index, stat) in stats.iter().enumerate() {
-        let burst_count = burst_count_at_index(burst_prefix, index, blended.len());
-        let in_activity_burst = burst_count >= TEMPORAL_BURST_MIN_COUNT;
+        let burst_count = burst_count_at_index(burst_prefix, index, blended.len(), config);
+        let in_activity_burst = burst_count >= config.temporal_burst_min_count;
 
         let suppress_weak_cut = stat.is_cut
             && in_activity_burst
-            && stat.hist_distance < TEMPORAL_BURST_RAW_HIST_MAX
-            && stat.score < TEMPORAL_BURST_RAW_SCORE_MAX;
+            && stat.hist_distance < config.temporal_burst_raw_hist_max
+            && stat.score < config.temporal_burst_raw_score_max;
         let suppress_weak_noncut = !stat.is_cut
             && in_activity_burst
-            && stat.score < TEMPORAL_BURST_NONRAW_SCORE_MAX
-            && blended[index] < TEMPORAL_BURST_NONRAW_BLEND_MAX;
+            && stat.score < config.temporal_burst_nonraw_score_max
+            && blended[index] < config.temporal_burst_nonraw_blend_max;
         let suppress_dense_noncut = !stat.is_cut
-            && burst_count >= TEMPORAL_BURST_DENSE_MIN_COUNT
-            && stat.score < TEMPORAL_BURST_DENSE_NONRAW_SCORE_MAX;
+            && burst_count >= config.temporal_burst_dense_min_count
+            && stat.score < config.temporal_burst_dense_nonraw_score_max;
         let suppress_followup_cut =
             stat.is_cut && !in_activity_burst && index > 0 && stats[index - 1].is_cut;
         if suppress_weak_cut
@@ -133,13 +179,13 @@ fn collect_candidates(
             continue;
         }
 
-        let primary = blended[index] >= HIST_BLEND_THRESHOLD
-            && stat.score >= FRAMES_SCORE_MIN
-            && is_local_peak(blended, index, CANDIDATE_PEAK_RADIUS);
-        let structural = stat.hist_distance <= STRUCTURE_HIST_MAX
-            && stat.grid_hist_distance >= STRUCTURE_GRID_HIST_MIN
-            && is_local_peak(grid_hist, index, CANDIDATE_PEAK_RADIUS);
-        let cut_fallback = is_cut_fallback_candidate(stat, in_activity_burst);
+        let primary = blended[index] >= config.hist_blend_threshold
+            && stat.score >= config.frames_score_min
+            && is_local_peak(blended, index, config.candidate_peak_radius);
+        let structural = stat.hist_distance <= config.structure_hist_max
+            && stat.grid_hist_distance >= config.structure_grid_hist_min
+            && is_local_peak(grid_hist, index, config.candidate_peak_radius);
+        let cut_fallback = is_cut_fallback_candidate(stat, in_activity_burst, config);
         if primary || structural || cut_fallback {
             candidates.push(index);
         }
@@ -152,14 +198,15 @@ fn best_candidate_index(
     stats: &[FrameCutStats],
     blended: &[f64],
     burst_prefix: &[usize],
+    config: &PostprocessConfig,
 ) -> Option<usize> {
     if let Some(fallback) = candidates
         .iter()
         .copied()
         .filter(|idx| {
-            let burst_count = burst_count_at_index(burst_prefix, *idx, blended.len());
-            let in_activity_burst = burst_count >= TEMPORAL_BURST_MIN_COUNT;
-            is_cut_fallback_candidate(&stats[*idx], in_activity_burst)
+            let burst_count = burst_count_at_index(burst_prefix, *idx, blended.len(), config);
+            let in_activity_burst = burst_count >= config.temporal_burst_min_count;
+            is_cut_fallback_candidate(&stats[*idx], in_activity_burst, config)
         })
         .min_by_key(|idx| stats[*idx].frame_index)
     {
@@ -177,6 +224,7 @@ fn select_cluster_peaks(
     candidate_indices: &[usize],
     blended: &[f64],
     burst_prefix: &[usize],
+    config: &PostprocessConfig,
 ) -> Vec<usize> {
     let mut refined: Vec<usize> = vec![0];
     let mut cluster: Vec<usize> = Vec::new();
@@ -184,13 +232,14 @@ fn select_cluster_peaks(
 
     for candidate in candidate_indices.iter().copied() {
         let frame = stats[candidate].frame_index;
-        if previous_frame.is_some_and(|prev| frame.saturating_sub(prev) < CLUSTER_GAP_FRAMES) {
+        if previous_frame.is_some_and(|prev| frame.saturating_sub(prev) < config.cluster_gap_frames)
+        {
             cluster.push(candidate);
             previous_frame = Some(frame);
             continue;
         }
 
-        if let Some(best) = best_candidate_index(&cluster, stats, blended, burst_prefix) {
+        if let Some(best) = best_candidate_index(&cluster, stats, blended, burst_prefix, config) {
             refined.push(stats[best].frame_index);
         }
         cluster.clear();
@@ -198,7 +247,7 @@ fn select_cluster_peaks(
         previous_frame = Some(frame);
     }
 
-    if let Some(best) = best_candidate_index(&cluster, stats, blended, burst_prefix) {
+    if let Some(best) = best_candidate_index(&cluster, stats, blended, burst_prefix, config) {
         refined.push(stats[best].frame_index);
     }
 
@@ -211,6 +260,7 @@ fn recover_dense_candidates(
     blended: &[f64],
     burst_prefix: &[usize],
     refined: &[usize],
+    config: &PostprocessConfig,
 ) -> Vec<usize> {
     let mut recovered: Vec<usize> = Vec::new();
 
@@ -218,7 +268,7 @@ fn recover_dense_candidates(
         let left = window[0];
         let right = window[1];
         let gap = right.saturating_sub(left);
-        if gap < DENSE_RECOVERY_MIN_GAP_FRAMES {
+        if gap < config.dense_recovery_min_gap_frames {
             continue;
         }
 
@@ -230,7 +280,7 @@ fn recover_dense_candidates(
                 frame > left && frame < right
             })
             .collect();
-        if interval_candidates.len() < DENSE_RECOVERY_MIN_CANDIDATES {
+        if interval_candidates.len() < config.dense_recovery_min_candidates {
             continue;
         }
 
@@ -238,19 +288,21 @@ fn recover_dense_candidates(
             .into_iter()
             .filter(|idx| {
                 let frame = stats[*idx].frame_index;
-                frame.saturating_sub(left) >= DENSE_RECOVERY_MARGIN_FRAMES
-                    && right.saturating_sub(frame) >= DENSE_RECOVERY_MARGIN_FRAMES
-                    && blended[*idx] >= DENSE_RECOVERY_BLEND_MIN
-                    && stats[*idx].score >= DENSE_RECOVERY_SCORE_MIN
+                frame.saturating_sub(left) >= config.dense_recovery_margin_frames
+                    && right.saturating_sub(frame) >= config.dense_recovery_margin_frames
+                    && blended[*idx] >= config.dense_recovery_blend_min
+                    && stats[*idx].score >= config.dense_recovery_score_min
             })
             .collect();
         if filtered.is_empty() {
             continue;
         }
 
-        let max_additions = (gap / DENSE_RECOVERY_TARGET_SPAN_FRAMES).max(1);
+        let max_additions = (gap / config.dense_recovery_target_span_frames).max(1);
         if max_additions == 1 {
-            if let Some(best) = best_candidate_index(&filtered, stats, blended, burst_prefix) {
+            if let Some(best) =
+                best_candidate_index(&filtered, stats, blended, burst_prefix, config)
+            {
                 recovered.push(stats[best].frame_index);
             }
             continue;
@@ -270,7 +322,8 @@ fn recover_dense_candidates(
                     frame >= start && frame <= end && !chosen_mask[*idx]
                 })
                 .collect();
-            if let Some(best) = best_candidate_index(&slot_candidates, stats, blended, burst_prefix)
+            if let Some(best) =
+                best_candidate_index(&slot_candidates, stats, blended, burst_prefix, config)
             {
                 chosen.push(best);
                 chosen_mask[best] = true;
@@ -298,23 +351,33 @@ fn recover_dense_candidates(
 }
 
 #[must_use]
-pub fn refine_frame_keyframes(stats: &[FrameCutStats]) -> Vec<usize> {
-    let baseline_keyframes = initial_keyframes(stats);
-    if stats.len() < MIN_POSTPROCESS_FRAMES {
+pub fn refine_frame_keyframes_with_config(
+    stats: &[FrameCutStats],
+    config: &PostprocessConfig,
+) -> Vec<usize> {
+    let baseline_keyframes = initial_keyframes(stats, config);
+    if stats.len() < config.min_postprocess_frames {
         return baseline_keyframes;
     }
 
-    let blended = build_blended_score(stats);
+    let blended = build_blended_score(stats, config);
     let grid_hist: Vec<f64> = stats.iter().map(|s| s.grid_hist_distance).collect();
-    let burst_prefix = burst_activity_prefix(&blended);
-    let candidate_indices = collect_candidates(stats, &blended, &grid_hist, &burst_prefix);
+    let burst_prefix = burst_activity_prefix(&blended, config);
+    let candidate_indices = collect_candidates(stats, &blended, &grid_hist, &burst_prefix, config);
     if candidate_indices.is_empty() {
         return baseline_keyframes;
     }
 
-    let mut refined = select_cluster_peaks(stats, &candidate_indices, &blended, &burst_prefix);
-    let recovered =
-        recover_dense_candidates(stats, &candidate_indices, &blended, &burst_prefix, &refined);
+    let mut refined =
+        select_cluster_peaks(stats, &candidate_indices, &blended, &burst_prefix, config);
+    let recovered = recover_dense_candidates(
+        stats,
+        &candidate_indices,
+        &blended,
+        &burst_prefix,
+        &refined,
+        config,
+    );
     refined.extend(recovered);
     refined.sort_unstable();
     refined.dedup();
@@ -344,7 +407,8 @@ mod tests {
                 })
                 .collect();
 
-            let keyframes = refine_frame_keyframes(&stats);
+            let keyframes =
+                refine_frame_keyframes_with_config(&stats, &PostprocessConfig::default());
             prop_assert!(!keyframes.is_empty());
             prop_assert_eq!(keyframes[0], 0);
             prop_assert!(keyframes.windows(2).all(|window| window[0] < window[1]));

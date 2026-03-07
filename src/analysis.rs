@@ -19,6 +19,8 @@ pub struct AnalyzeOptions {
     pub xvid_config: detector::XvidDetectorConfig,
     /// Adaptive detector settings.
     pub adaptive_config: detector::DetectorConfig,
+    /// Keyframe postprocess tuning.
+    pub postprocess_config: postprocess::PostprocessConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,7 +301,8 @@ fn analyze_video_impl(options: &AnalyzeOptions) -> SCuiseiResult<AnalysisResult>
         },
     )?;
 
-    let keyframes = postprocess::refine_frame_keyframes(&frame_stats);
+    let keyframes =
+        postprocess::refine_frame_keyframes_with_config(&frame_stats, &options.postprocess_config);
     Ok(AnalysisResult {
         keyframes,
         pass_decisions,
