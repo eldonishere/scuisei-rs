@@ -1,10 +1,3 @@
-<p>
-    <a href="https://pypi.org/project/scuisei-rs/" alt="PyPI">
-        <img src="https://img.shields.io/pypi/v/scuisei-rs" /></a>
-    <a href="https://crates.io/crates/scuisei-rs" alt="Cargo">
-        <img src="https://img.shields.io/crates/v/scuisei-rs" /></a>
-</p>
-
 # scuisei-rs
 
 Blazing fast successor for [SCXvid](https://github.com/soyokaze/SCXvid-standalone), with arguably better scene change detections than existing solutions. Also outputs compatible `.pass` files.
