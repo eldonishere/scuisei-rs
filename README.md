@@ -15,12 +15,15 @@ cargo build --release
 
 ```bash
 $ ./scuisei-rs --help
-$ ./scuisei-rs -i input.mp4 > output.agi
+$ ./scuisei-rs -i input.mp4 -o output.agi
 $ ./scuisei-rs -i input.mp4 --format xvid -o output.pass
-$ ./scuisei-rs -i input.mp4 --format xvid --hwdec vaapi > output.pass
-$ ./scuisei-rs -i input.mp4 --format frames
+$ ./scuisei-rs -i input.mp4 --format xvid --hwdec vaapi -o output.pass
+$ ./scuisei-rs -i input.mp4 --format frames -o frames.txt
+$ ./scuisei-rs -i input.mp4 --format frames > frames.txt
 $ ./scuisei-rs -i input.mp4 --native-res # slow - and default thresholds are tuned for the downsampled clip
 ```
+
+If `-o/--output` is omitted, output is written to stdout.
 
 `--hwdec` keeps decode on the requested device when possible, but frames are still transferred back to CPU memory for analysis, so end-to-end speedups depend on the input and hardware stack.
 
@@ -66,11 +69,11 @@ Python also exposes `scuisei_rs.PostprocessConfig()` for optional keyframe postp
 
 ## Release
 
-After committing version bump: (`Cargo.toml`/`pyproject.toml`)
+After updating `Cargo.toml`, `pyproject.toml`, and `Cargo.lock` to the same version and committing the changes, create and push a matching tag. The release workflow will attach the built artifacts to the corresponding GitHub Release.
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 ## Disclaimer
