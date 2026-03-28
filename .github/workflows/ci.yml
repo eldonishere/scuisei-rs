@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  WINDOWS_FFMPEG_VERSION: 8.0.1
 
 jobs:
   rust_checks:
@@ -32,15 +33,20 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $archive = "$env:RUNNER_TEMP\ffmpeg-release-full-shared.7z"
+          $ffmpegVersion = "${{ env.WINDOWS_FFMPEG_VERSION }}"
+          $archive = "$env:RUNNER_TEMP\ffmpeg-$ffmpegVersion-full_build-shared.zip"
           $extractRoot = "$env:RUNNER_TEMP\ffmpeg"
-          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
-            choco install 7zip --no-progress -y
+          $asset = "ffmpeg-$ffmpegVersion-full_build-shared.zip"
+          $uri = "https://github.com/GyanD/codexffmpeg/releases/download/$ffmpegVersion/$asset"
+          if (Test-Path $extractRoot) {
+            Remove-Item -LiteralPath $extractRoot -Recurse -Force
           }
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile $archive
           New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
-          & 7z x $archive "-o$extractRoot" -y | Out-Null
-          $ffmpegDir = Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot -Force
+          $ffmpegDir = Get-ChildItem -Path $extractRoot -Directory |
+            Where-Object { $_.Name -like "ffmpeg-*-full_build-shared" } |
+            Select-Object -First 1
           if (-not $ffmpegDir) {
             throw "Failed to locate extracted FFmpeg directory"
           }
@@ -125,15 +131,20 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $archive = "$env:RUNNER_TEMP\ffmpeg-release-full-shared.7z"
+          $ffmpegVersion = "${{ env.WINDOWS_FFMPEG_VERSION }}"
+          $archive = "$env:RUNNER_TEMP\ffmpeg-$ffmpegVersion-full_build-shared.zip"
           $extractRoot = "$env:RUNNER_TEMP\ffmpeg"
-          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
-            choco install 7zip --no-progress -y
+          $asset = "ffmpeg-$ffmpegVersion-full_build-shared.zip"
+          $uri = "https://github.com/GyanD/codexffmpeg/releases/download/$ffmpegVersion/$asset"
+          if (Test-Path $extractRoot) {
+            Remove-Item -LiteralPath $extractRoot -Recurse -Force
           }
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile $archive
           New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
-          & 7z x $archive "-o$extractRoot" -y | Out-Null
-          $ffmpegDir = Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot -Force
+          $ffmpegDir = Get-ChildItem -Path $extractRoot -Directory |
+            Where-Object { $_.Name -like "ffmpeg-*-full_build-shared" } |
+            Select-Object -First 1
           if (-not $ffmpegDir) {
             throw "Failed to locate extracted FFmpeg directory"
           }
