@@ -195,9 +195,13 @@ jobs:
         if: runner.os == 'Linux'
         run: maturin build -b pyo3 --release --strip --features "python,ffmpeg-build" --out dist/unrepaired
 
-      - name: Build wheel artifacts (macOS/Windows)
-        if: runner.os != 'Linux'
+      - name: Build wheel artifacts (macOS)
+        if: runner.os == 'macOS'
         run: maturin build -b pyo3 --release --features python --out dist/unrepaired
+
+      - name: Build wheel artifacts (Windows)
+        if: runner.os == 'Windows'
+        run: maturin build -b pyo3 --release --features python --auditwheel=repair --out dist
 
       - name: Repair wheel (Linux)
         if: runner.os == 'Linux'
@@ -211,17 +215,6 @@ jobs:
         if: runner.os == 'macOS'
         run: python -m delocate.cmd.delocate_wheel --wheel-dir dist dist/unrepaired/*.whl
 
-      - name: Repair wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $wheel = Get-ChildItem dist\unrepaired\*.whl | Select-Object -First 1
-          if (-not $wheel) {
-            throw "No wheel found in dist/unrepaired"
-          }
-          $ffmpegBin = "$env:FFMPEG_DIR\bin"
-          python -m delvewheel repair --add-path $ffmpegBin -w dist $wheel.FullName
-
       - name: Verify wheel bundles FFmpeg runtime (Linux)
         if: runner.os == 'Linux'
         run: python scripts/check_wheel_ffmpeg_runtime.py --platform linux --allow-static --wheel-glob "dist/*.whl"
@@ -233,6 +226,9 @@ jobs:
       - name: Verify wheel bundles FFmpeg runtime (Windows)
         if: runner.os == 'Windows'
         run: python scripts/check_wheel_ffmpeg_runtime.py --platform windows --wheel-glob "dist/*.whl"
+
+      - name: Add license notices to wheel
+        run: python scripts/add_wheel_notices.py --wheel-glob "dist/*.whl" LICENSE LICENSE-GPL NOTICE-FFMPEG.md README.md
 
       - name: Install built wheel (Linux/macOS)
         if: runner.os != 'Windows'

@@ -11,4 +11,10 @@ requires-python = ">=3.9"
 [tool.maturin]
 bindings = "pyo3"
 features = ["python"]
+include = [
+    "LICENSE",
+    "LICENSE-GPL",
+    "NOTICE-FFMPEG.md",
+    "README.md",
+]
 module-name = "scuisei_rs"

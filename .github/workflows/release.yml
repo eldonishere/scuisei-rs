@@ -125,9 +125,13 @@ jobs:
         if: runner.os == 'Linux'
         run: maturin build -b pyo3 --release --strip --features "python,ffmpeg-build" --out dist/unrepaired
 
-      - name: Build wheel (macOS/Windows)
-        if: runner.os != 'Linux'
+      - name: Build wheel (macOS)
+        if: runner.os == 'macOS'
         run: maturin build -b pyo3 --release --features python --out dist/unrepaired
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        run: maturin build -b pyo3 --release --features python --auditwheel=repair --out dist
 
       - name: Repair wheel (Linux)
         if: runner.os == 'Linux'
@@ -141,17 +145,6 @@ jobs:
         if: runner.os == 'macOS'
         run: python -m delocate.cmd.delocate_wheel --wheel-dir dist dist/unrepaired/*.whl
 
-      - name: Repair wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $wheel = Get-ChildItem dist\unrepaired\*.whl | Select-Object -First 1
-          if (-not $wheel) {
-            throw "No wheel found in dist/unrepaired"
-          }
-          $ffmpegBin = "$env:FFMPEG_DIR\bin"
-          python -m delvewheel repair --add-path $ffmpegBin -w dist $wheel.FullName
-
       - name: Verify wheel bundles FFmpeg runtime (Linux)
         if: runner.os == 'Linux'
         run: python scripts/check_wheel_ffmpeg_runtime.py --platform linux --allow-static --wheel-glob "dist/*.whl"
@@ -163,6 +156,9 @@ jobs:
       - name: Verify wheel bundles FFmpeg runtime (Windows)
         if: runner.os == 'Windows'
         run: python scripts/check_wheel_ffmpeg_runtime.py --platform windows --wheel-glob "dist/*.whl"
+
+      - name: Add license notices to wheel
+        run: python scripts/add_wheel_notices.py --wheel-glob "dist/*.whl" LICENSE LICENSE-GPL NOTICE-FFMPEG.md README.md
 
       - name: Install built wheel (Linux/macOS)
         if: runner.os != 'Windows'
@@ -199,7 +195,11 @@ jobs:
           os="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
           arch="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
           version="${{ needs.verify_version.outputs.version }}"
-          tar -C target/release -czf "dist/scuisei-rs-${os}-${arch}-${version}.tar.gz" scuisei-rs
+          package_dir="dist/scuisei-rs-${os}-${arch}-${version}"
+          mkdir -p "${package_dir}"
+          cp target/release/scuisei-rs LICENSE LICENSE-GPL NOTICE-FFMPEG.md README.md "${package_dir}/"
+          tar -C dist -czf "dist/scuisei-rs-${os}-${arch}-${version}.tar.gz" "scuisei-rs-${os}-${arch}-${version}"
+          rm -rf "${package_dir}"
 
       - name: Package CLI binary (Windows)
         if: runner.os == 'Windows'
@@ -209,7 +209,11 @@ jobs:
           $os = $env:RUNNER_OS.ToLowerInvariant()
           $arch = $env:RUNNER_ARCH.ToLowerInvariant()
           $version = "${{ needs.verify_version.outputs.version }}"
-          Compress-Archive -Path target/release/scuisei-rs.exe -DestinationPath "dist/scuisei-rs-$os-$arch-$version.zip" -Force
+          $packageDir = "dist\scuisei-rs-$os-$arch-$version"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item -Path target/release/scuisei-rs.exe, LICENSE, LICENSE-GPL, NOTICE-FFMPEG.md, README.md -Destination $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath "dist/scuisei-rs-$os-$arch-$version.zip" -Force
+          Remove-Item -LiteralPath $packageDir -Recurse -Force
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
