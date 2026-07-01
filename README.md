@@ -79,3 +79,8 @@ git push origin v0.1.4
 ## Disclaimer
 
 This was vibecoded.
+
+## LICENSE
+
+This project's source code is licensed under the MIT License. 
+However, when this software is combined or distributed with FFmpeg DLLs that were compiled with GPLv3-covered components, the resulting binary distribution must comply with the terms of the GNU General Public License v3.0.
