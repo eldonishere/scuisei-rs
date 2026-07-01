@@ -2,8 +2,11 @@ use crate::{SCuiseiError, SCuiseiResult};
 use crate::{decoder, detector, postprocess, simd_metrics};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::mpsc;
 
 const ADAPTIVE_PROMOTION_MIN_RATIO: f64 = 0.85;
+/// Decode-thread → detection-thread pipeline depth (frames in flight).
+const PIPELINE_DEPTH: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AnalysisTarget {
@@ -65,72 +68,70 @@ struct CurrentFrameSnapshot {
     grid_hist: [u32; simd_metrics::GRID_HIST_LEN],
 }
 
-struct CurrentFrame<'a> {
-    pixels: &'a [u8],
-    width: usize,
-    height: usize,
-    grid_hist_plan: &'a simd_metrics::GridHistogramPlan,
+/// Detection-thread caches for downscale and grid-histogram plans.
+struct PlanCache {
+    downscale: Option<((usize, usize), simd_metrics::DownscalePlan)>,
+    grid: Option<simd_metrics::GridHistogramPlan>,
 }
 
-#[derive(Debug)]
-struct WorkingFramePlan {
-    source_dims: (usize, usize),
-    downscale_plan: simd_metrics::DownscalePlan,
-    grid_hist_plan: simd_metrics::GridHistogramPlan,
-}
-
-#[derive(Debug)]
-struct FramePreparationCache {
-    native_grid_plan: Option<simd_metrics::GridHistogramPlan>,
-    working_plan: Option<WorkingFramePlan>,
-}
-
-impl FramePreparationCache {
+impl PlanCache {
     fn new() -> Self {
         Self {
-            native_grid_plan: None,
-            working_plan: None,
+            downscale: None,
+            grid: None,
         }
     }
 
-    fn native_grid_plan(
-        &mut self,
-        width: usize,
-        height: usize,
-    ) -> &simd_metrics::GridHistogramPlan {
+    fn downscale_plan(&mut self, width: usize, height: usize) -> &simd_metrics::DownscalePlan {
         if self
-            .native_grid_plan
+            .downscale
+            .as_ref()
+            .is_none_or(|(dims, _)| *dims != (width, height))
+        {
+            let (work_w, work_h) = compute_downscale_dims(width, height);
+            self.downscale = Some((
+                (width, height),
+                simd_metrics::DownscalePlan::new(width, height, work_w, work_h),
+            ));
+        }
+
+        &self
+            .downscale
+            .as_ref()
+            .expect("downscale plan must exist")
+            .1
+    }
+
+    fn grid_plan(&mut self, width: usize, height: usize) -> &simd_metrics::GridHistogramPlan {
+        if self
+            .grid
             .as_ref()
             .is_none_or(|plan| plan.dimensions() != (width, height))
         {
-            self.native_grid_plan = Some(simd_metrics::GridHistogramPlan::new(width, height));
+            self.grid = Some(simd_metrics::GridHistogramPlan::new(width, height));
         }
 
-        self.native_grid_plan
-            .as_ref()
-            .expect("native grid plan must exist")
+        self.grid.as_ref().expect("grid histogram plan must exist")
+    }
+}
+
+/// Copy or downscale the frame's luma into an owned analysis-resolution
+/// buffer, returning the buffer's dimensions.
+fn prepare_analysis_pixels(
+    view: decoder::LumaView<'_>,
+    info: decoder::FrameInfo,
+    native_res: bool,
+    plans: &mut PlanCache,
+    pixels: &mut Vec<u8>,
+) -> (usize, usize) {
+    if native_res {
+        simd_metrics::extract_packed8(view.data, view.stride, info.width, info.height, pixels);
+        return (info.width, info.height);
     }
 
-    fn working_plan(&mut self, width: usize, height: usize) -> &WorkingFramePlan {
-        if self
-            .working_plan
-            .as_ref()
-            .is_none_or(|plan| plan.source_dims != (width, height))
-        {
-            let (work_w, work_h) = compute_downscale_dims(width, height);
-            let downscale_plan = simd_metrics::DownscalePlan::new(width, height, work_w, work_h);
-            let grid_hist_plan = simd_metrics::GridHistogramPlan::new(work_w, work_h);
-            self.working_plan = Some(WorkingFramePlan {
-                source_dims: (width, height),
-                downscale_plan,
-                grid_hist_plan,
-            });
-        }
-
-        self.working_plan
-            .as_ref()
-            .expect("working frame plan must exist")
-    }
+    let plan = plans.downscale_plan(info.width, info.height);
+    plan.run_packed8(view.data, view.stride, pixels);
+    plan.dst_dimensions()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -170,23 +171,13 @@ impl DetectionState {
         self.frame_index == 0
     }
 
-    fn absorb(
-        &mut self,
-        curr_luma: &[u8],
-        curr_small: &mut Vec<u8>,
-        native_res: bool,
-        snapshot: &CurrentFrameSnapshot,
-    ) {
+    /// Swap the current frame in as the new previous frame.
+    fn absorb(&mut self, curr_small: &mut Vec<u8>, snapshot: &CurrentFrameSnapshot) {
         self.prev_dims = Some((snapshot.width, snapshot.height));
         self.prev_hist = snapshot.hist;
         self.prev_grid_hist = snapshot.grid_hist;
-        if native_res {
-            self.prev_small.resize(curr_luma.len(), 0);
-            self.prev_small.copy_from_slice(curr_luma);
-        } else {
-            std::mem::swap(&mut self.prev_small, curr_small);
-        }
         self.frame_index = self.frame_index.saturating_add(1);
+        std::mem::swap(&mut self.prev_small, curr_small);
     }
 }
 
@@ -215,53 +206,16 @@ fn compute_downscale_dims(width: usize, height: usize) -> (usize, usize) {
     (out_w, out_h)
 }
 
-fn prepare_working_luma(
-    curr_luma: &[u8],
-    width: usize,
-    height: usize,
-    working_luma: &mut Vec<u8>,
-    cache: &mut FramePreparationCache,
-) -> (usize, usize) {
-    let working_plan = cache.working_plan(width, height);
-    working_plan.downscale_plan.run(curr_luma, working_luma);
-    working_plan.downscale_plan.dst_dimensions()
-}
-
-fn prepare_current_frame<'a>(
-    curr_luma: &'a [u8],
-    info: decoder::FrameInfo,
-    native_res: bool,
-    curr_small: &'a mut Vec<u8>,
-    cache: &'a mut FramePreparationCache,
-) -> CurrentFrame<'a> {
-    let (width, height, pixels, grid_hist_plan) = if native_res {
-        let grid_hist_plan = cache.native_grid_plan(info.width, info.height);
-        (info.width, info.height, curr_luma, grid_hist_plan)
-    } else {
-        let (work_w, work_h) =
-            prepare_working_luma(curr_luma, info.width, info.height, curr_small, cache);
-        let grid_hist_plan = &cache.working_plan(info.width, info.height).grid_hist_plan;
-        (work_w, work_h, curr_small.as_slice(), grid_hist_plan)
-    };
-
-    CurrentFrame {
-        pixels,
-        width,
-        height,
-        grid_hist_plan,
-    }
-}
-
 fn analyze_frame(
     state: &DetectionState,
     xvid_detector: &mut detector::XvidDetector,
     adaptive_detector: &mut detector::Detector,
-    current: &CurrentFrame<'_>,
+    pixels: &[u8],
     snapshot: &CurrentFrameSnapshot,
     sad: u64,
 ) -> DetectionRecord {
-    let dims_changed = state.prev_dims != Some((current.width, current.height))
-        || state.prev_small.len() != current.pixels.len();
+    let dims_changed = state.prev_dims != Some((snapshot.width, snapshot.height))
+        || state.prev_small.len() != pixels.len();
     if dims_changed || state.prev_small.is_empty() {
         xvid_detector.reset();
         adaptive_detector.reset();
@@ -278,28 +232,24 @@ fn analyze_frame(
         };
     }
 
-    let xvid_decision = xvid_detector.decide(
-        &state.prev_small,
-        current.pixels,
-        current.width,
-        current.height,
-    );
+    let xvid_decision =
+        xvid_detector.decide(&state.prev_small, pixels, snapshot.width, snapshot.height);
     let hist_distance = simd_metrics::histogram_distance_16_from_hists(
         &state.prev_hist,
         &snapshot.hist,
-        current.pixels.len(),
+        pixels.len(),
     );
     let grid_hist_distance = simd_metrics::grid_histogram_distance_16_from_hists(
         &state.prev_grid_hist,
         &snapshot.grid_hist,
-        current.pixels.len(),
+        pixels.len(),
     );
     let grid_hist_median = simd_metrics::grid_histogram_median_cell_distance_16_from_hists(
         &state.prev_grid_hist,
         &snapshot.grid_hist,
     );
 
-    let sad_score = simd_metrics::normalize_sad(sad, current.width, current.height);
+    let sad_score = simd_metrics::normalize_sad(sad, snapshot.width, snapshot.height);
     let adaptive_score = adaptive_detector.blended_score(sad_score, hist_distance);
     let (adaptive_cut, _) = adaptive_detector.decide_with_threshold(adaptive_score, hist_distance);
     adaptive_detector.observe(adaptive_score);
@@ -375,75 +325,89 @@ pub fn analyze_pass_decisions(options: &AnalyzeOptions) -> SCuiseiResult<Vec<boo
     analyze_video_impl(options, AnalysisTarget::PassDecisions).map(|result| result.pass_decisions)
 }
 
-fn analyze_video_impl(
-    options: &AnalyzeOptions,
+/// Per-frame detection driver shared by the pipelined and inline paths.
+struct DetectionRun<'a> {
+    options: &'a AnalyzeOptions,
     target: AnalysisTarget,
-) -> SCuiseiResult<AnalysisResult> {
-    ensure_ffmpeg_initialized()?;
+    xvid_detector: detector::XvidDetector,
+    adaptive_detector: detector::Detector,
+    state: DetectionState,
+    extractor: decoder::LumaExtractor,
+    plans: PlanCache,
+    curr_small: Vec<u8>,
+    frame_stats: Vec<postprocess::FrameCutStats>,
+    pass_decisions: Vec<bool>,
+}
 
-    let mut decoder = decoder::Decoder::open(&options.input, options.hwdec.as_deref())?;
-    let frame_count_hint = decoder.frame_count_hint();
+impl<'a> DetectionRun<'a> {
+    fn new(options: &'a AnalyzeOptions, target: AnalysisTarget) -> Self {
+        Self {
+            options,
+            target,
+            xvid_detector: detector::XvidDetector::new(options.xvid_config),
+            adaptive_detector: detector::Detector::new(options.adaptive_config),
+            state: DetectionState::new(),
+            extractor: decoder::LumaExtractor::new(),
+            plans: PlanCache::new(),
+            curr_small: Vec::new(),
+            frame_stats: Vec::new(),
+            pass_decisions: Vec::new(),
+        }
+    }
 
-    let mut xvid_detector = detector::XvidDetector::new(options.xvid_config);
-    let mut adaptive_detector = detector::Detector::new(options.adaptive_config);
-    let mut state = DetectionState::new();
-    let mut curr_small: Vec<u8> = Vec::new();
-    let mut frame_preparation_cache = FramePreparationCache::new();
-    let mut frame_stats: Vec<postprocess::FrameCutStats> = if target.needs_keyframes() {
-        Vec::with_capacity(frame_count_hint.map_or(0, |count| count.saturating_sub(1)))
-    } else {
-        Vec::with_capacity(0)
-    };
-    let mut pass_decisions: Vec<bool> = if target.needs_pass_decisions() {
-        Vec::with_capacity(frame_count_hint.unwrap_or(0))
-    } else {
-        Vec::with_capacity(0)
-    };
-
-    decoder.decode_luma_frames(|curr_luma, info| {
-        let current = prepare_current_frame(
-            curr_luma,
+    fn process_frame(&mut self, frame: &ffmpeg_next::frame::Video) -> SCuiseiResult<()> {
+        let info = decoder::FrameInfo {
+            width: frame.width() as usize,
+            height: frame.height() as usize,
+        };
+        let view = self.extractor.luma_view(frame)?;
+        let (width, height) = prepare_analysis_pixels(
+            view,
             info,
-            options.native_res,
-            &mut curr_small,
-            &mut frame_preparation_cache,
+            self.options.native_res,
+            &mut self.plans,
+            &mut self.curr_small,
         );
-        let frame_metrics = current.grid_hist_plan.accumulate_frame_metrics(
-            (!state.is_first_frame()).then_some(state.prev_small.as_slice()),
-            current.pixels,
-        );
+
+        let frame_metrics = self
+            .plans
+            .grid_plan(width, height)
+            .accumulate_frame_metrics(
+                (!self.state.is_first_frame()).then_some(self.state.prev_small.as_slice()),
+                &self.curr_small,
+            );
         let snapshot = CurrentFrameSnapshot {
-            width: current.width,
-            height: current.height,
+            width,
+            height,
             hist: frame_metrics.hist,
             grid_hist: frame_metrics.grid_hist,
         };
 
-        if state.is_first_frame() {
-            if target.needs_pass_decisions() {
-                pass_decisions.push(true);
+        if self.state.is_first_frame() {
+            if self.target.needs_pass_decisions() {
+                self.pass_decisions.push(true);
             }
-            state.absorb(curr_luma, &mut curr_small, options.native_res, &snapshot);
+            self.state.absorb(&mut self.curr_small, &snapshot);
             return Ok(());
         }
 
         let record = analyze_frame(
-            &state,
-            &mut xvid_detector,
-            &mut adaptive_detector,
-            &current,
+            &self.state,
+            &mut self.xvid_detector,
+            &mut self.adaptive_detector,
+            &self.curr_small,
             &snapshot,
             frame_metrics.sad,
         );
-        if options.dump_scores {
-            dump_score_line(state.frame_index, record);
+        if self.options.dump_scores {
+            dump_score_line(self.state.frame_index, record);
         }
-        if target.needs_pass_decisions() {
-            pass_decisions.push(record.is_cut);
+        if self.target.needs_pass_decisions() {
+            self.pass_decisions.push(record.is_cut);
         }
-        if target.needs_keyframes() {
-            frame_stats.push(postprocess::FrameCutStats {
-                frame_index: state.frame_index,
+        if self.target.needs_keyframes() {
+            self.frame_stats.push(postprocess::FrameCutStats {
+                frame_index: self.state.frame_index,
                 is_cut: record.is_cut,
                 score: record.score,
                 hist_distance: record.hist_distance,
@@ -452,19 +416,70 @@ fn analyze_video_impl(
             });
         }
 
-        state.absorb(curr_luma, &mut curr_small, options.native_res, &snapshot);
+        self.state.absorb(&mut self.curr_small, &snapshot);
         Ok(())
+    }
+
+    fn finish(self) -> AnalysisResult {
+        let keyframes = if self.target.needs_keyframes() {
+            postprocess::refine_frame_keyframes_with_config(
+                &self.frame_stats,
+                &self.options.postprocess_config,
+            )
+        } else {
+            Vec::new()
+        };
+        AnalysisResult {
+            keyframes,
+            pass_decisions: self.pass_decisions,
+        }
+    }
+}
+
+fn analyze_video_impl(
+    options: &AnalyzeOptions,
+    target: AnalysisTarget,
+) -> SCuiseiResult<AnalysisResult> {
+    ensure_ffmpeg_initialized()?;
+
+    let mut run = DetectionRun::new(options, target);
+
+    if options.native_res {
+        // Native-res detection is internally parallel (rayon) and would fight
+        // the decoder's thread pool; run it inline on the decode thread.
+        let mut decoder = decoder::Decoder::open(&options.input, options.hwdec.as_deref())?;
+        decoder.decode_frames(|frame| {
+            run.process_frame(&frame)?;
+            Ok(frame)
+        })?;
+        return Ok(run.finish());
+    }
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<ffmpeg_next::frame::Video>(PIPELINE_DEPTH);
+    let (recycle_tx, recycle_rx) = mpsc::channel::<ffmpeg_next::frame::Video>();
+
+    std::thread::scope(|scope| -> SCuiseiResult<()> {
+        let producer = scope.spawn(move || -> SCuiseiResult<()> {
+            let mut decoder = decoder::Decoder::open(&options.input, options.hwdec.as_deref())?;
+            decoder.decode_frames(|frame| {
+                frame_tx
+                    .send(frame)
+                    .map_err(|_| SCuiseiError::decode("analysis stage stopped unexpectedly"))?;
+                Ok(recycle_rx
+                    .try_recv()
+                    .unwrap_or_else(|_| ffmpeg_next::frame::Video::empty()))
+            })
+        });
+
+        for frame in frame_rx {
+            run.process_frame(&frame)?;
+            let _ = recycle_tx.send(frame);
+        }
+
+        producer.join().expect("decode thread panicked")
     })?;
 
-    let keyframes = if target.needs_keyframes() {
-        postprocess::refine_frame_keyframes_with_config(&frame_stats, &options.postprocess_config)
-    } else {
-        Vec::new()
-    };
-    Ok(AnalysisResult {
-        keyframes,
-        pass_decisions,
-    })
+    Ok(run.finish())
 }
 
 #[cfg(test)]

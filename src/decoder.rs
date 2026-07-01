@@ -132,11 +132,19 @@ mod hwaccel {
 }
 
 fn configure_decoder_threading(ctx: &mut ffmpeg::codec::context::Context) {
-    // Enable FFmpeg's built-in frame threading for software decode.
-    // count=0 lets FFmpeg auto-pick an appropriate worker count.
+    // Enable FFmpeg's built-in frame threading for software decode. FFmpeg's
+    // auto pick (count=0) caps at 16 workers; request the real core count so
+    // wider machines keep scaling. FFmpeg clamps values beyond the codec
+    // limit, and decoder thread count never changes decoded output.
     let mut config = ffmpeg::codec::threading::Config::kind(ffmpeg::codec::threading::Type::Frame);
-    config.count = 0;
+    config.count = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
     ctx.set_threading(config);
+
+    // Demote this context's log chatter (e.g. the >16-thread advisory) below
+    // the default level while leaving real errors visible.
+    unsafe {
+        (*ctx.as_mut_ptr()).log_level_offset = 16;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,13 +153,17 @@ pub struct FrameInfo {
     pub height: usize,
 }
 
+/// Borrowed view of an 8-bit luma plane with a row stride in bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct LumaView<'a> {
+    pub data: &'a [u8],
+    pub stride: usize,
+}
+
 pub struct Decoder {
     ictx: ffmpeg::format::context::Input,
     video_stream_index: usize,
-    frame_count_hint: Option<usize>,
     video: ffmpeg::decoder::Video,
-    scaler: Option<ScalingContext>,
-    scaler_input: Option<ScalerInput>,
     hw: Option<hwaccel::Binding>,
 }
 
@@ -162,22 +174,12 @@ struct ScalerInput {
     height: u32,
 }
 
-struct DecodeFrameBuffers {
-    decoded: Video,
-    gray: Video,
-    transferred: Video,
-    luma: Vec<u8>,
-}
-
-impl DecodeFrameBuffers {
-    fn new() -> Self {
-        Self {
-            decoded: Video::empty(),
-            gray: Video::empty(),
-            transferred: Video::empty(),
-            luma: Vec::new(),
-        }
-    }
+/// Reusable frame slots for the decode loop.
+struct SpareFrames {
+    /// Target for `receive_frame`.
+    recv: Video,
+    /// Target for hardware-frame transfers to CPU memory.
+    cpu: Video,
 }
 
 impl Decoder {
@@ -191,9 +193,6 @@ impl Decoder {
             .best(Type::Video)
             .ok_or_else(|| SCuiseiError::unsupported("no video stream found"))?;
         let video_stream_index = input.index();
-        let frame_count_hint = usize::try_from(input.frames())
-            .ok()
-            .filter(|count| *count > 0);
 
         let mut context_decoder = ffmpeg::codec::context::Context::from_parameters(
             input.parameters(),
@@ -229,24 +228,22 @@ impl Decoder {
         Ok(Self {
             ictx,
             video_stream_index,
-            frame_count_hint,
             video,
-            scaler: None,
-            scaler_input: None,
             hw,
         })
     }
 
-    #[must_use]
-    pub fn frame_count_hint(&self) -> Option<usize> {
-        self.frame_count_hint
-    }
-
-    pub fn decode_luma_frames<F>(&mut self, mut on_frame: F) -> SCuiseiResult<()>
+    /// Decode the video stream and hand each frame (already transferred to CPU
+    /// memory) to `on_frame` in decode order. The callback returns a frame
+    /// whose buffers may be reused for subsequent decoding.
+    pub fn decode_frames<F>(&mut self, mut on_frame: F) -> SCuiseiResult<()>
     where
-        F: FnMut(&[u8], FrameInfo) -> SCuiseiResult<()>,
+        F: FnMut(Video) -> SCuiseiResult<Video>,
     {
-        let mut buffers = DecodeFrameBuffers::new();
+        let mut spare = SpareFrames {
+            recv: Video::empty(),
+            cpu: Video::empty(),
+        };
 
         for (stream, packet) in self.ictx.packets() {
             if stream.index() != self.video_stream_index {
@@ -255,11 +252,9 @@ impl Decoder {
             self.video.send_packet(&packet).map_err(|error| {
                 SCuiseiError::decode_with("failed to send packet to decoder", &error)
             })?;
-            receive_and_process_frames(
+            receive_and_forward_frames(
                 &mut self.video,
-                &mut self.scaler,
-                &mut self.scaler_input,
-                &mut buffers,
+                &mut spare,
                 self.hw.is_some(),
                 &mut on_frame,
             )?;
@@ -268,11 +263,9 @@ impl Decoder {
         self.video.send_eof().map_err(|error| {
             SCuiseiError::decode_with("failed to signal EOF to decoder", &error)
         })?;
-        receive_and_process_frames(
+        receive_and_forward_frames(
             &mut self.video,
-            &mut self.scaler,
-            &mut self.scaler_input,
-            &mut buffers,
+            &mut spare,
             self.hw.is_some(),
             &mut on_frame,
         )?;
@@ -292,19 +285,17 @@ fn parse_hw_device_type(name: &str) -> SCuiseiResult<ffmpeg::ffi::AVHWDeviceType
     Ok(ty)
 }
 
-fn receive_and_process_frames<F>(
+fn receive_and_forward_frames<F>(
     decoder: &mut ffmpeg::decoder::Video,
-    scaler: &mut Option<ScalingContext>,
-    scaler_input: &mut Option<ScalerInput>,
-    buffers: &mut DecodeFrameBuffers,
+    spare: &mut SpareFrames,
     require_hw: bool,
     on_frame: &mut F,
 ) -> SCuiseiResult<()>
 where
-    F: FnMut(&[u8], FrameInfo) -> SCuiseiResult<()>,
+    F: FnMut(Video) -> SCuiseiResult<Video>,
 {
     loop {
-        match decoder.receive_frame(&mut buffers.decoded) {
+        match decoder.receive_frame(&mut spare.recv) {
             Ok(()) => {}
             Err(ffmpeg::Error::Other { errno })
                 if errno == ffmpeg::util::error::EAGAIN
@@ -318,47 +309,69 @@ where
             }
         }
 
-        let is_hw = hwaccel::Binding::is_hardware_frame(&buffers.decoded);
+        let is_hw = hwaccel::Binding::is_hardware_frame(&spare.recv);
         validate_hw_frame_requirement(require_hw, is_hw)?;
-        let frame: &Video = if is_hw {
-            hwaccel::Binding::transfer_to_cpu(&buffers.decoded, &mut buffers.transferred)?;
-            &buffers.transferred
+        let outgoing = if is_hw {
+            hwaccel::Binding::transfer_to_cpu(&spare.recv, &mut spare.cpu)?;
+            std::mem::replace(&mut spare.cpu, Video::empty())
         } else {
-            &buffers.decoded
+            std::mem::replace(&mut spare.recv, Video::empty())
         };
 
-        let info = FrameInfo {
-            width: frame.width() as usize,
-            height: frame.height() as usize,
-        };
-
-        let pixels = if is_direct_luma_format(frame.format()) {
-            if let Some(luma) =
-                borrow_packed_luma_plane(frame).map_err(|error| decode_anyhow(&error))?
-            {
-                luma
-            } else {
-                copy_luma_plane(frame, &mut buffers.luma).map_err(|error| decode_anyhow(&error))?;
-                buffers.luma.as_slice()
-            }
+        let recycled = on_frame(outgoing)?;
+        if is_hw {
+            spare.cpu = recycled;
         } else {
-            scale_to_gray8(scaler, scaler_input, frame, &mut buffers.gray)
-                .map_err(|error| decode_anyhow(&error))?;
-            if let Some(luma) =
-                borrow_packed_luma_plane(&buffers.gray).map_err(|error| decode_anyhow(&error))?
-            {
-                luma
-            } else {
-                copy_luma_plane(&buffers.gray, &mut buffers.luma)
-                    .map_err(|error| decode_anyhow(&error))?;
-                buffers.luma.as_slice()
-            }
-        };
-
-        on_frame(pixels, info)?;
+            spare.recv = recycled;
+        }
     }
 
     Ok(())
+}
+
+/// Converts decoded frames into borrowable 8-bit luma planes, reusing scaler
+/// state and the GRAY8 scratch frame across calls.
+pub struct LumaExtractor {
+    scaler: Option<ScalingContext>,
+    scaler_input: Option<ScalerInput>,
+    gray: Video,
+}
+
+impl LumaExtractor {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            scaler: None,
+            scaler_input: None,
+            gray: Video::empty(),
+        }
+    }
+
+    /// Borrow the frame's luma plane, converting via `swscale` to GRAY8 first
+    /// when the pixel format has no directly usable 8-bit luma plane.
+    ///
+    /// # Errors
+    /// Returns an error if the scaler fails or the plane layout is invalid.
+    pub fn luma_view<'a>(&'a mut self, frame: &'a Video) -> SCuiseiResult<LumaView<'a>> {
+        if is_direct_luma_format(frame.format()) {
+            return borrow_packed8(frame).map_err(|error| decode_anyhow(&error));
+        }
+
+        scale_to_gray8(
+            &mut self.scaler,
+            &mut self.scaler_input,
+            frame,
+            &mut self.gray,
+        )
+        .map_err(|error| decode_anyhow(&error))?;
+        borrow_packed8(&self.gray).map_err(|error| decode_anyhow(&error))
+    }
+}
+
+impl Default for LumaExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn decode_anyhow(error: &anyhow::Error) -> SCuiseiError {
@@ -464,94 +477,48 @@ fn is_direct_luma_format(format: Pixel) -> bool {
             | Pixel::YUVJ444P
             | Pixel::NV12
             | Pixel::NV21
+            | Pixel::NV16
+            | Pixel::NV24
+            | Pixel::NV42
     )
 }
 
-fn borrow_packed_luma_plane(frame: &Video) -> AnyResult<Option<&[u8]>> {
+fn borrow_packed8(frame: &Video) -> AnyResult<LumaView<'_>> {
     let width = frame.width() as usize;
     let height = frame.height() as usize;
     let stride = frame.stride(0);
-
-    if stride < width {
-        anyhow::bail!("unexpected luma stride ({stride}) for width ({width})");
-    }
-
-    let needed = width.checked_mul(height).context("frame size overflow")?;
-    let data = frame.data(0);
-    let src_needed = stride
-        .checked_mul(height)
-        .context("stride multiplication overflow")?;
-    if data.len() < src_needed {
-        anyhow::bail!(
-            "insufficient luma data (have {}, need {src_needed})",
-            data.len()
-        );
-    }
-
-    if stride == width {
-        let src = data
-            .get(..needed)
-            .context("insufficient luma data for contiguous borrow")?;
-        return Ok(Some(src));
-    }
-
-    Ok(None)
+    validate_plane(frame.data(0), stride, width, height)?;
+    Ok(LumaView {
+        data: frame.data(0),
+        stride,
+    })
 }
 
-fn copy_luma_plane(frame: &Video, out: &mut Vec<u8>) -> AnyResult<()> {
-    let width = frame.width() as usize;
-    let height = frame.height() as usize;
-    let stride = frame.stride(0);
-
-    let needed = width.checked_mul(height).context("frame size overflow")?;
-
-    out.resize(needed, 0);
-
-    if stride < width {
-        anyhow::bail!("unexpected luma stride ({stride}) for width ({width})");
+fn validate_plane(data: &[u8], stride: usize, row_bytes: usize, height: usize) -> AnyResult<()> {
+    if stride < row_bytes {
+        anyhow::bail!("unexpected luma stride ({stride}) for row size ({row_bytes})");
     }
-
-    let data = frame.data(0);
-    let src_needed = stride
-        .checked_mul(height)
+    let needed = stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_add(row_bytes))
         .context("stride multiplication overflow")?;
-    if data.len() < src_needed {
+    if data.len() < needed {
         anyhow::bail!(
-            "insufficient luma data (have {}, need {src_needed})",
+            "insufficient luma data (have {}, need {needed})",
             data.len()
         );
     }
-
-    if stride == width {
-        let src = data
-            .get(..needed)
-            .context("insufficient luma data for contiguous copy")?;
-        out.copy_from_slice(src);
-        return Ok(());
-    }
-
-    for row in 0..height {
-        let src_start = row
-            .checked_mul(stride)
-            .context("stride multiplication overflow")?;
-        let src_end = src_start
-            .checked_add(width)
-            .context("stride range overflow")?;
-        let dst_start = row
-            .checked_mul(width)
-            .context("width multiplication overflow")?;
-        let dst_end = dst_start.checked_add(width).context("dst range overflow")?;
-
-        out[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
-    }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ScalerInput, parse_hw_device_type, scale_to_gray8, validate_hw_frame_requirement};
+    use super::{
+        LumaExtractor, ScalerInput, borrow_packed8, parse_hw_device_type, scale_to_gray8,
+        validate_hw_frame_requirement,
+    };
     use crate::SCuiseiError;
+    use crate::simd_metrics;
     use ffmpeg_next::format::Pixel;
     use ffmpeg_next::util::frame::video::Video;
 
@@ -562,6 +529,63 @@ mod tests {
             frame.data_mut(plane).fill(fill);
         }
         frame
+    }
+
+    fn fill_plane0_random_u16(frame: &mut Video, mask: u16, seed: u32) {
+        let mut state = seed;
+        for chunk in frame.data_mut(0).chunks_exact_mut(2) {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let value = u16::try_from((state >> 8) & 0xFFFF).expect("masked to 16 bits") & mask;
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn extractor_high_bit_output_matches_direct_swscale() {
+        ffmpeg_next::init().expect("ffmpeg init should succeed");
+        let mut src = Video::new(Pixel::YUV420P10LE, 64, 48);
+        fill_plane0_random_u16(&mut src, 0x03FF, 0xC0FF_EE00);
+
+        let mut scaler = None;
+        let mut scaler_input = None;
+        let mut gray = Video::empty();
+        scale_to_gray8(&mut scaler, &mut scaler_input, &src, &mut gray)
+            .expect("swscale conversion should succeed");
+
+        let mut extractor = LumaExtractor::new();
+        let view = extractor
+            .luma_view(&src)
+            .expect("extractor should convert high-bit frames");
+        assert_eq!(view.data, gray.data(0));
+        assert_eq!(view.stride, gray.stride(0));
+    }
+
+    #[test]
+    fn packed8_strided_extraction_matches_plane() {
+        ffmpeg_next::init().expect("ffmpeg init should succeed");
+        let mut src = Video::new(Pixel::YUV420P, 61, 29);
+        for (index, byte) in src.data_mut(0).iter_mut().enumerate() {
+            *byte = u8::try_from(index % 251).expect("fits");
+        }
+
+        let view = borrow_packed8(&src).expect("borrow should not fail");
+        let (data, stride) = (view.data, view.stride);
+
+        let mut extracted = Vec::new();
+        simd_metrics::extract_packed8(data, stride, 61, 29, &mut extracted);
+        for y in 0..29_usize {
+            assert_eq!(
+                &extracted[y * 61..(y + 1) * 61],
+                &data[y * stride..y * stride + 61],
+            );
+        }
+
+        let plan = simd_metrics::DownscalePlan::new(61, 29, 17, 11);
+        let mut sampled_strided = Vec::new();
+        plan.run_packed8(data, stride, &mut sampled_strided);
+        let mut sampled_contiguous = Vec::new();
+        plan.run(&extracted, &mut sampled_contiguous);
+        assert_eq!(sampled_strided, sampled_contiguous);
     }
 
     #[test]

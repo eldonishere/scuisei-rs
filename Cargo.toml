@@ -1,16 +1,14 @@
 [package]
 name = "scuisei-rs"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.93"
 description = "Scene-change detection library and CLI"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/yuv420p10le/scuisei-rs"
-homepage = "https://github.com/yuv420p10le/scuisei-rs"
-documentation = "https://docs.rs/scuisei-rs"
-keywords = ["scene-detection", "video", "ffmpeg", "aegisub"]
-categories = ["command-line-utilities", "multimedia::video"]
+publish = false
+repository = "https://github.com/eldonishere/scuisei-rs"
+homepage = "https://github.com/eldonishere/scuisei-rs"
 exclude = [
     ".github/**",
     ".devcontainer/**",

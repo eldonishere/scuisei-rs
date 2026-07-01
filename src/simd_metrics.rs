@@ -9,39 +9,38 @@ pub const GRID_HIST_LEN: usize = 16 * GRID_HIST_X * GRID_HIST_Y;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DownscalePlan {
+    src_width: usize,
     dst_width: usize,
     dst_height: usize,
     x_indices: Vec<usize>,
-    src_row_offsets: Vec<usize>,
+    y_indices: Vec<usize>,
 }
 
 impl DownscalePlan {
     #[must_use]
     pub fn new(src_width: usize, src_height: usize, dst_width: usize, dst_height: usize) -> Self {
-        let x_indices = if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+        let degenerate = src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0;
+        let x_indices = if degenerate {
             Vec::new()
         } else {
             (0..dst_width)
                 .map(|x_out| x_out.saturating_mul(src_width) / dst_width)
                 .collect()
         };
-        let src_row_offsets =
-            if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
-                Vec::new()
-            } else {
-                (0..dst_height)
-                    .map(|y_out| {
-                        let y_in = y_out.saturating_mul(src_height) / dst_height;
-                        y_in.saturating_mul(src_width)
-                    })
-                    .collect()
-            };
+        let y_indices = if degenerate {
+            Vec::new()
+        } else {
+            (0..dst_height)
+                .map(|y_out| y_out.saturating_mul(src_height) / dst_height)
+                .collect()
+        };
 
         Self {
+            src_width,
             dst_width,
             dst_height,
             x_indices,
-            src_row_offsets,
+            y_indices,
         }
     }
 
@@ -50,21 +49,52 @@ impl DownscalePlan {
         (self.dst_width, self.dst_height)
     }
 
-    pub fn run(&self, src: &[u8], dst: &mut Vec<u8>) {
+    fn prepare_dst(&self, dst: &mut Vec<u8>) -> bool {
         if self.dst_width == 0 || self.dst_height == 0 {
             dst.clear();
+            return false;
+        }
+        dst.resize(self.dst_width.saturating_mul(self.dst_height), 0);
+        true
+    }
+
+    pub fn run(&self, src: &[u8], dst: &mut Vec<u8>) {
+        self.run_packed8(src, self.src_width, dst);
+    }
+
+    /// Sample an 8-bit luma plane with an arbitrary row stride (in bytes).
+    pub fn run_packed8(&self, src: &[u8], src_stride: usize, dst: &mut Vec<u8>) {
+        if !self.prepare_dst(dst) {
             return;
         }
 
-        let needed = self.dst_width.saturating_mul(self.dst_height);
-        dst.resize(needed, 0);
-
-        for (y_out, row_in) in self.src_row_offsets.iter().copied().enumerate() {
+        for (y_out, y_in) in self.y_indices.iter().copied().enumerate() {
+            let row_in = y_in.saturating_mul(src_stride);
             let row_out = y_out.saturating_mul(self.dst_width);
             for (x_out, x_in) in self.x_indices.iter().copied().enumerate() {
                 dst[row_out + x_out] = src[row_in + x_in];
             }
         }
+    }
+}
+
+/// Copy an 8-bit luma plane with an arbitrary row stride into a contiguous buffer.
+pub fn extract_packed8(
+    src: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+    dst: &mut Vec<u8>,
+) {
+    dst.resize(width.saturating_mul(height), 0);
+    if src_stride == width {
+        dst.copy_from_slice(&src[..width * height]);
+        return;
+    }
+    for row in 0..height {
+        let src_start = row * src_stride;
+        let dst_start = row * width;
+        dst[dst_start..dst_start + width].copy_from_slice(&src[src_start..src_start + width]);
     }
 }
 
