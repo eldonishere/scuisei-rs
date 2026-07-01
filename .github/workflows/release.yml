@@ -212,6 +212,14 @@ jobs:
           $packageDir = "dist\scuisei-rs-$os-$arch-$version"
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item -Path target/release/scuisei-rs.exe, LICENSE, LICENSE-GPL, NOTICE-FFMPEG.md, README.md -Destination $packageDir
+          $ffmpegBin = Join-Path $env:FFMPEG_DIR "bin"
+          foreach ($dll in @("avcodec-62.dll", "avformat-62.dll", "avutil-60.dll", "swresample-6.dll", "swscale-9.dll")) {
+            $source = Join-Path $ffmpegBin $dll
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "Missing FFmpeg runtime DLL: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination $packageDir
+          }
           Compress-Archive -Path $packageDir -DestinationPath "dist/scuisei-rs-$os-$arch-$version.zip" -Force
           Remove-Item -LiteralPath $packageDir -Recurse -Force
 
