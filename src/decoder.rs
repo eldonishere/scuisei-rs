@@ -3,6 +3,7 @@ use anyhow::{Context as _, Result as AnyResult};
 use ffmpeg::format::Pixel;
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as ScalingContext, flag::Flags as ScalingFlags};
+use ffmpeg::util::color;
 use ffmpeg::util::frame::video::Video;
 use ffmpeg_next as ffmpeg;
 use std::ffi::c_char;
@@ -133,12 +134,19 @@ mod hwaccel {
 
 fn configure_decoder_threading(ctx: &mut ffmpeg::codec::context::Context) {
     // Enable FFmpeg's built-in frame threading for software decode. FFmpeg's
-    // auto pick (count=0) caps at 16 workers; request the real core count so
-    // wider machines keep scaling. FFmpeg clamps values beyond the codec
-    // limit, and decoder thread count never changes decoded output.
+    // auto pick (count=0) caps at 16 workers; request extra frame slots so
+    // high-reorder codecs can keep wide machines busy. FFmpeg clamps values
+    // beyond codec limits, and decoder thread count never changes output.
     let mut config = ffmpeg::codec::threading::Config::kind(ffmpeg::codec::threading::Type::Frame);
-    config.count = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
+    config.count = std::thread::available_parallelism()
+        .map_or(0, std::num::NonZero::get)
+        .saturating_mul(2)
+        .min(64);
     ctx.set_threading(config);
+    unsafe {
+        (*ctx.as_mut_ptr()).thread_type =
+            ffmpeg::ffi::FF_THREAD_FRAME | ffmpeg::ffi::FF_THREAD_SLICE;
+    }
 
     // Demote this context's log chatter (e.g. the >16-thread advisory) below
     // the default level while leaving real errors visible.
@@ -158,6 +166,19 @@ pub struct FrameInfo {
 pub struct LumaView<'a> {
     pub data: &'a [u8],
     pub stride: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Luma16View<'a> {
+    pub data: &'a [u8],
+    pub stride: usize,
+    pub params: crate::simd_metrics::Planar16Params,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum LumaSource<'a> {
+    Packed8(LumaView<'a>),
+    Planar16(Luma16View<'a>),
 }
 
 pub struct Decoder {
@@ -366,6 +387,27 @@ impl LumaExtractor {
         .map_err(|error| decode_anyhow(&error))?;
         borrow_packed8(&self.gray).map_err(|error| decode_anyhow(&error))
     }
+
+    /// Borrow the frame luma in the cheapest form accepted by the analysis
+    /// pipeline. High-bit planar YUV can be sampled directly when the caller is
+    /// going to downscale, avoiding a full-frame `swscale` conversion.
+    ///
+    /// # Errors
+    /// Returns an error if the selected luma plane layout is invalid or if
+    /// fallback scaling fails.
+    pub fn luma_source<'a>(
+        &'a mut self,
+        frame: &'a Video,
+        allow_direct_high_bit: bool,
+    ) -> SCuiseiResult<LumaSource<'a>> {
+        if allow_direct_high_bit && let Some(format) = high_bit_luma_format(frame.format()) {
+            return borrow_planar16(frame, format)
+                .map(LumaSource::Planar16)
+                .map_err(|error| decode_anyhow(&error));
+        }
+
+        self.luma_view(frame).map(LumaSource::Packed8)
+    }
 }
 
 impl Default for LumaExtractor {
@@ -483,6 +525,101 @@ fn is_direct_luma_format(format: Pixel) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HighBitLumaFormat {
+    bit_depth: u8,
+    little_endian: bool,
+}
+
+fn high_bit_luma_format(format: Pixel) -> Option<HighBitLumaFormat> {
+    let little_endian = matches!(
+        format,
+        Pixel::YUV420P9LE
+            | Pixel::YUV422P9LE
+            | Pixel::YUV444P9LE
+            | Pixel::YUV420P10LE
+            | Pixel::YUV422P10LE
+            | Pixel::YUV440P10LE
+            | Pixel::YUV444P10LE
+            | Pixel::YUV420P12LE
+            | Pixel::YUV422P12LE
+            | Pixel::YUV440P12LE
+            | Pixel::YUV444P12LE
+            | Pixel::YUV420P14LE
+            | Pixel::YUV422P14LE
+            | Pixel::YUV444P14LE
+            | Pixel::YUV420P16LE
+            | Pixel::YUV422P16LE
+            | Pixel::YUV444P16LE
+    );
+    let big_endian = matches!(
+        format,
+        Pixel::YUV420P9BE
+            | Pixel::YUV422P9BE
+            | Pixel::YUV444P9BE
+            | Pixel::YUV420P10BE
+            | Pixel::YUV422P10BE
+            | Pixel::YUV440P10BE
+            | Pixel::YUV444P10BE
+            | Pixel::YUV420P12BE
+            | Pixel::YUV422P12BE
+            | Pixel::YUV440P12BE
+            | Pixel::YUV444P12BE
+            | Pixel::YUV420P14BE
+            | Pixel::YUV422P14BE
+            | Pixel::YUV444P14BE
+            | Pixel::YUV420P16BE
+            | Pixel::YUV422P16BE
+            | Pixel::YUV444P16BE
+    );
+    if !little_endian && !big_endian {
+        return None;
+    }
+
+    let bit_depth = match format {
+        Pixel::YUV420P9LE
+        | Pixel::YUV420P9BE
+        | Pixel::YUV422P9LE
+        | Pixel::YUV422P9BE
+        | Pixel::YUV444P9LE
+        | Pixel::YUV444P9BE => 9,
+        Pixel::YUV420P10LE
+        | Pixel::YUV420P10BE
+        | Pixel::YUV422P10LE
+        | Pixel::YUV422P10BE
+        | Pixel::YUV440P10LE
+        | Pixel::YUV440P10BE
+        | Pixel::YUV444P10LE
+        | Pixel::YUV444P10BE => 10,
+        Pixel::YUV420P12LE
+        | Pixel::YUV420P12BE
+        | Pixel::YUV422P12LE
+        | Pixel::YUV422P12BE
+        | Pixel::YUV440P12LE
+        | Pixel::YUV440P12BE
+        | Pixel::YUV444P12LE
+        | Pixel::YUV444P12BE => 12,
+        Pixel::YUV420P14LE
+        | Pixel::YUV420P14BE
+        | Pixel::YUV422P14LE
+        | Pixel::YUV422P14BE
+        | Pixel::YUV444P14LE
+        | Pixel::YUV444P14BE => 14,
+        Pixel::YUV420P16LE
+        | Pixel::YUV420P16BE
+        | Pixel::YUV422P16LE
+        | Pixel::YUV422P16BE
+        | Pixel::YUV444P16LE
+        | Pixel::YUV444P16BE => 16,
+        _ => return None,
+    };
+
+    Some(HighBitLumaFormat {
+        bit_depth,
+        little_endian,
+    })
+}
+
 fn borrow_packed8(frame: &Video) -> AnyResult<LumaView<'_>> {
     let width = frame.width() as usize;
     let height = frame.height() as usize;
@@ -491,6 +628,22 @@ fn borrow_packed8(frame: &Video) -> AnyResult<LumaView<'_>> {
     Ok(LumaView {
         data: frame.data(0),
         stride,
+    })
+}
+
+fn borrow_planar16(frame: &Video, format: HighBitLumaFormat) -> AnyResult<Luma16View<'_>> {
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.stride(0);
+    validate_plane(frame.data(0), stride, width.saturating_mul(2), height)?;
+    Ok(Luma16View {
+        data: frame.data(0),
+        stride,
+        params: crate::simd_metrics::Planar16Params {
+            bit_depth: format.bit_depth,
+            little_endian: format.little_endian,
+            full_range: frame.color_range() == color::Range::JPEG,
+        },
     })
 }
 
@@ -514,8 +667,8 @@ fn validate_plane(data: &[u8], stride: usize, row_bytes: usize, height: usize) -
 #[cfg(test)]
 mod tests {
     use super::{
-        LumaExtractor, ScalerInput, borrow_packed8, parse_hw_device_type, scale_to_gray8,
-        validate_hw_frame_requirement,
+        LumaExtractor, LumaSource, ScalerInput, borrow_packed8, parse_hw_device_type,
+        scale_to_gray8, validate_hw_frame_requirement,
     };
     use crate::SCuiseiError;
     use crate::simd_metrics;
@@ -586,6 +739,90 @@ mod tests {
         let mut sampled_contiguous = Vec::new();
         plan.run(&extracted, &mut sampled_contiguous);
         assert_eq!(sampled_strided, sampled_contiguous);
+    }
+
+    #[test]
+    fn direct_high_bit_luma_matches_swscale() {
+        ffmpeg_next::init().expect("ffmpeg init should succeed");
+        let width: usize = 64;
+        let height: usize = 48;
+        let mut src = Video::new(Pixel::YUV420P10LE, 64, 48);
+        // Smooth horizontal gradient over the full 10-bit range, plus flat
+        // below-black and above-white rows. Smoothness matters: swscale's
+        // FAST_BILINEAR "conversion" mixes horizontal neighbours slightly, so
+        // only low-frequency content is comparable per-pixel.
+        let stride = src.stride(0);
+        for y in 0..height {
+            for x in 0..width {
+                let value = match y {
+                    0 => 20_u16,
+                    1 => 1_000,
+                    _ => u16::try_from(x * 1023 / (width - 1)).expect("fits in u16"),
+                };
+                let idx = y * stride + x * 2;
+                src.data_mut(0)[idx..idx + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        let mut scaler = None;
+        let mut scaler_input = None;
+        let mut gray = Video::empty();
+        scale_to_gray8(&mut scaler, &mut scaler_input, &src, &mut gray)
+            .expect("swscale conversion should succeed");
+
+        let mut extractor = LumaExtractor::new();
+        let LumaSource::Planar16(view) = extractor
+            .luma_source(&src, true)
+            .expect("high-bit frame should borrow directly")
+        else {
+            panic!("expected direct planar16 luma source");
+        };
+        assert_eq!(view.params.bit_depth, 10);
+        assert!(view.params.little_endian);
+        assert!(!view.params.full_range);
+
+        let mut direct = Vec::new();
+        simd_metrics::extract_planar16_packed8(
+            view.data,
+            view.stride,
+            width,
+            height,
+            view.params,
+            &mut direct,
+        );
+        for y in 0..height {
+            for x in 0..width {
+                let sws = gray.data(0)[y * gray.stride(0) + x];
+                let ours = direct[y * width + x];
+                // Limited-range clipping must agree exactly; the gradient may
+                // wobble a little from swscale's fixed-point + dither rounding.
+                let tolerance = if y < 2 { 0 } else { 2 };
+                assert!(
+                    sws.abs_diff(ours) <= tolerance,
+                    "pixel ({x},{y}): swscale={sws} direct={ours}"
+                );
+            }
+        }
+
+        // Downscale-sampling of the 16-bit plane must match converting first
+        // and sampling second.
+        let plan = simd_metrics::DownscalePlan::new(width, height, 17, 11);
+        let mut sampled_direct = Vec::new();
+        plan.run_planar16_packed8(view.data, view.stride, view.params, &mut sampled_direct);
+        let mut sampled_converted = Vec::new();
+        plan.run(&direct, &mut sampled_converted);
+        assert_eq!(sampled_direct, sampled_converted);
+    }
+
+    #[test]
+    fn luma_source_without_high_bit_falls_back_to_swscale() {
+        ffmpeg_next::init().expect("ffmpeg init should succeed");
+        let src = make_video(Pixel::YUV420P10LE, 32, 32);
+        let mut extractor = LumaExtractor::new();
+        let source = extractor
+            .luma_source(&src, false)
+            .expect("fallback should convert via swscale");
+        assert!(matches!(source, LumaSource::Packed8(_)));
     }
 
     #[test]

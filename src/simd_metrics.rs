@@ -1,7 +1,15 @@
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::sync::OnceLock;
-use wide::{u8x16, u16x8, u32x8};
+use wide::u32x8;
+#[cfg(not(target_arch = "x86_64"))]
+use wide::{u8x16, u16x8};
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{
+    __m128i, _mm_cvtsi128_si64, _mm_loadu_si128, _mm_sad_epu8, _mm_set1_epi8, _mm_setzero_si128,
+    _mm_srli_si128,
+};
 
 pub const GRID_HIST_X: usize = 4;
 pub const GRID_HIST_Y: usize = 4;
@@ -10,10 +18,12 @@ pub const GRID_HIST_LEN: usize = 16 * GRID_HIST_X * GRID_HIST_Y;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DownscalePlan {
     src_width: usize,
+    src_height: usize,
     dst_width: usize,
     dst_height: usize,
     x_indices: Vec<usize>,
     y_indices: Vec<usize>,
+    exact_decimation_steps: Option<(usize, usize)>,
 }
 
 impl DownscalePlan {
@@ -34,13 +44,19 @@ impl DownscalePlan {
                 .map(|y_out| y_out.saturating_mul(src_height) / dst_height)
                 .collect()
         };
+        let exact_decimation_steps = (!degenerate
+            && src_width.is_multiple_of(dst_width)
+            && src_height.is_multiple_of(dst_height))
+        .then_some((src_width / dst_width, src_height / dst_height));
 
         Self {
             src_width,
+            src_height,
             dst_width,
             dst_height,
             x_indices,
             y_indices,
+            exact_decimation_steps,
         }
     }
 
@@ -68,6 +84,17 @@ impl DownscalePlan {
             return;
         }
 
+        if let Some((x_step, y_step)) = self.exact_decimation_steps {
+            for y_out in 0..self.dst_height {
+                let row_in = y_out.saturating_mul(y_step).saturating_mul(src_stride);
+                let row_out = y_out.saturating_mul(self.dst_width);
+                for x_out in 0..self.dst_width {
+                    dst[row_out + x_out] = src[row_in + x_out.saturating_mul(x_step)];
+                }
+            }
+            return;
+        }
+
         for (y_out, y_in) in self.y_indices.iter().copied().enumerate() {
             let row_in = y_in.saturating_mul(src_stride);
             let row_out = y_out.saturating_mul(self.dst_width);
@@ -75,6 +102,58 @@ impl DownscalePlan {
                 dst[row_out + x_out] = src[row_in + x_in];
             }
         }
+    }
+
+    /// Sample a 16-bit luma plane with an arbitrary row stride into packed 8-bit luma.
+    ///
+    /// # Panics
+    /// Panics if `src` is too short for the sampled plane coordinates.
+    pub fn run_planar16_packed8(
+        &self,
+        src: &[u8],
+        src_stride: usize,
+        params: Planar16Params,
+        dst: &mut Vec<u8>,
+    ) {
+        if !self.prepare_dst(dst) {
+            return;
+        }
+        let needed = self
+            .planar16_required_len(src_stride)
+            .expect("validated plane");
+        assert!(src.len() >= needed, "validated plane");
+
+        if let Some((x_step, y_step)) = self.exact_decimation_steps {
+            for y_out in 0..self.dst_height {
+                let row_in = y_out.saturating_mul(y_step).saturating_mul(src_stride);
+                let row_out = y_out.saturating_mul(self.dst_width);
+                for x_out in 0..self.dst_width {
+                    let src_idx = row_in + x_out.saturating_mul(x_step).saturating_mul(2);
+                    let sample = read_u16_sample(src, src_idx, params.little_endian);
+                    dst[row_out + x_out] = scale_luma16_to_u8(sample, params);
+                }
+            }
+            return;
+        }
+
+        for (y_out, y_in) in self.y_indices.iter().copied().enumerate() {
+            let row_in = y_in.saturating_mul(src_stride);
+            let row_out = y_out.saturating_mul(self.dst_width);
+            for (x_out, x_in) in self.x_indices.iter().copied().enumerate() {
+                let src_idx = row_in + x_in.saturating_mul(2);
+                let sample = read_u16_sample(src, src_idx, params.little_endian);
+                dst[row_out + x_out] = scale_luma16_to_u8(sample, params);
+            }
+        }
+    }
+
+    fn planar16_required_len(&self, src_stride: usize) -> Option<usize> {
+        let max_y = self.y_indices.last().copied()?;
+        let max_x = self.x_indices.last().copied()?;
+        max_y
+            .checked_mul(src_stride)?
+            .checked_add(max_x.checked_mul(2)?)?
+            .checked_add(2)
     }
 }
 
@@ -96,6 +175,95 @@ pub fn extract_packed8(
         let dst_start = row * width;
         dst[dst_start..dst_start + width].copy_from_slice(&src[src_start..src_start + width]);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Planar16Params {
+    pub bit_depth: u8,
+    pub little_endian: bool,
+    pub full_range: bool,
+}
+
+/// Copy a 16-bit luma plane into a contiguous packed 8-bit buffer.
+///
+/// # Panics
+/// Panics if `src` is too short for `width`, `height`, and `src_stride`.
+pub fn extract_planar16_packed8(
+    src: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+    params: Planar16Params,
+    dst: &mut Vec<u8>,
+) {
+    dst.resize(width.saturating_mul(height), 0);
+    if height == 0 || width == 0 {
+        return;
+    }
+    let needed = height
+        .saturating_sub(1)
+        .checked_mul(src_stride)
+        .and_then(|bytes| bytes.checked_add(width.saturating_mul(2)))
+        .expect("validated plane");
+    assert!(src.len() >= needed, "validated plane");
+
+    for row in 0..height {
+        let src_start = row.saturating_mul(src_stride);
+        let dst_start = row.saturating_mul(width);
+        for col in 0..width {
+            let src_idx = src_start + col.saturating_mul(2);
+            let sample = read_u16_sample(src, src_idx, params.little_endian);
+            dst[dst_start + col] = scale_luma16_to_u8(sample, params);
+        }
+    }
+}
+
+fn read_u16_sample(src: &[u8], index: usize, little_endian: bool) -> u16 {
+    debug_assert!(index + 1 < src.len());
+    // SAFETY: public planar16 entry points validate the sampled plane length once.
+    let sample = unsafe { std::ptr::read_unaligned(src.as_ptr().add(index).cast::<u16>()) };
+    if little_endian {
+        u16::from_le(sample)
+    } else {
+        u16::from_be(sample)
+    }
+}
+
+fn scale_luma16_to_u8(sample: u16, params: Planar16Params) -> u8 {
+    if params.full_range {
+        return match params.bit_depth {
+            9 => scale_full_range::<511>(sample),
+            10 => scale_full_range::<1_023>(sample),
+            12 => scale_full_range::<4_095>(sample),
+            14 => scale_full_range::<16_383>(sample),
+            _ => scale_full_range::<65_535>(sample),
+        };
+    }
+
+    match params.bit_depth {
+        9 => scale_limited_range::<32, 470>(sample),
+        10 => scale_limited_range::<64, 940>(sample),
+        12 => scale_limited_range::<256, 3_760>(sample),
+        14 => scale_limited_range::<1_024, 15_040>(sample),
+        _ => scale_limited_range::<4_096, 60_160>(sample),
+    }
+}
+
+fn scale_full_range<const MAX: u32>(sample: u16) -> u8 {
+    let sample = u32::from(sample).min(MAX);
+    u8::try_from(((sample * 255) + (MAX / 2)) / MAX).unwrap_or(u8::MAX)
+}
+
+fn scale_limited_range<const BLACK: u32, const WHITE: u32>(sample: u16) -> u8 {
+    let sample = u32::from(sample);
+    if sample <= BLACK {
+        return 0;
+    }
+    if sample >= WHITE {
+        return u8::MAX;
+    }
+
+    u8::try_from(((sample - BLACK) * 255) / (WHITE - BLACK)).unwrap_or(u8::MAX)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,16 +391,7 @@ pub fn sad_u8(prev: &[u8], curr: &[u8]) -> u64 {
     let len = prev.len();
 
     while i + 16 <= len {
-        let a = load_u8x16(&prev[i..]);
-        let b = load_u8x16(&curr[i..]);
-        let diff = a.max(b) - a.min(b);
-
-        let low = u16x8::from_u8x16_low(diff);
-        let high = u16x8::from_u8x16_high(diff);
-
-        total += sum_u16x8(low);
-        total += sum_u16x8(high);
-
+        total += sad16_bytes(&prev[i..], &curr[i..]);
         i += 16;
     }
 
@@ -311,35 +470,63 @@ pub fn grid_histogram_median_cell_distance_16_from_hists(
     prev: &[u32; GRID_HIST_LEN],
     curr: &[u32; GRID_HIST_LEN],
 ) -> f64 {
-    let cells = GRID_HIST_X.saturating_mul(GRID_HIST_Y);
-    if cells == 0 {
-        return 0.0;
-    }
+    grid_histogram_distances_16_from_hists(prev, curr, 0).1
+}
 
+#[must_use]
+pub fn grid_histogram_distance_16_from_hists(
+    prev: &[u32; GRID_HIST_LEN],
+    curr: &[u32; GRID_HIST_LEN],
+    total_pixels: usize,
+) -> f64 {
+    grid_histogram_distances_16_from_hists(prev, curr, total_pixels).0
+}
+
+#[must_use]
+pub fn grid_histogram_distances_16_from_hists(
+    prev: &[u32; GRID_HIST_LEN],
+    curr: &[u32; GRID_HIST_LEN],
+    total_pixels: usize,
+) -> (f64, f64) {
+    let cells = GRID_HIST_X.saturating_mul(GRID_HIST_Y);
     let mut distances: [f64; GRID_HIST_X * GRID_HIST_Y] = [0.0; GRID_HIST_X * GRID_HIST_Y];
     let mut count: usize = 0;
+    let mut intersection: u64 = 0;
 
     for cell in 0..cells {
         let base = cell.saturating_mul(16);
-        let mut intersection: u64 = 0;
-        let mut total: u64 = 0;
+        let mut cell_intersection: u64 = 0;
+        let mut cell_total: u64 = 0;
 
         for bin in 0..16 {
             let a = prev[base + bin];
             let b = curr[base + bin];
-            intersection += u64::from(a.min(b));
-            total += u64::from(a);
+            let bin_intersection = u64::from(a.min(b));
+            cell_intersection += bin_intersection;
+            intersection += bin_intersection;
+            cell_total += u64::from(a);
         }
 
-        if total == 0 {
+        if cell_total == 0 {
             continue;
         }
 
-        let similarity = u64_to_f64_exact(intersection) / u64_to_f64_exact(total);
+        let similarity = u64_to_f64_exact(cell_intersection) / u64_to_f64_exact(cell_total);
         distances[count] = (1.0 - similarity).clamp(0.0, 1.0);
         count = count.saturating_add(1);
     }
 
+    let median = median_distance(&mut distances, count);
+    let total_u64 = u64::try_from(total_pixels).unwrap_or(u64::MAX);
+    if total_u64 == 0 {
+        return (0.0, median);
+    }
+
+    let similarity = u64_to_f64_exact(intersection) / u64_to_f64_exact(total_u64);
+    ((1.0 - similarity).clamp(0.0, 1.0), median)
+}
+
+fn median_distance(distances: &mut [f64; GRID_HIST_X * GRID_HIST_Y], count: usize) -> f64 {
     if count == 0 {
         return 0.0;
     }
@@ -358,31 +545,6 @@ pub fn grid_histogram_median_cell_distance_16_from_hists(
             .unwrap_or(upper);
         (lower + upper) * 0.5
     }
-}
-
-#[must_use]
-pub fn grid_histogram_distance_16_from_hists(
-    prev: &[u32; GRID_HIST_LEN],
-    curr: &[u32; GRID_HIST_LEN],
-    total_pixels: usize,
-) -> f64 {
-    if total_pixels == 0 {
-        return 0.0;
-    }
-
-    let intersection: u64 = prev
-        .iter()
-        .zip(curr.iter())
-        .map(|(&a, &b)| u64::from(a.min(b)))
-        .sum();
-
-    let total_u64 = u64::try_from(total_pixels).unwrap_or(u64::MAX);
-    if total_u64 == 0 {
-        return 0.0;
-    }
-
-    let similarity = u64_to_f64_exact(intersection) / u64_to_f64_exact(total_u64);
-    (1.0 - similarity).clamp(0.0, 1.0)
 }
 
 #[must_use]
@@ -457,13 +619,7 @@ fn sad16x16_with_cutoff(
         let prev_row = (pair.prev_y + y) * width;
         let curr_idx = curr_row + pair.curr_x;
         let prev_idx = prev_row + pair.prev_x;
-        let a = load_u8x16(&curr[curr_idx..]);
-        let b = load_u8x16(&prev[prev_idx..]);
-        let diff = a.max(b) - a.min(b);
-
-        let low = u16x8::from_u8x16_low(diff);
-        let high = u16x8::from_u8x16_high(diff);
-        let row_total = sum_u16x8(low).saturating_add(sum_u16x8(high));
+        let row_total = sad16_bytes(&curr[curr_idx..], &prev[prev_idx..]);
         total = total.saturating_add(u32::try_from(row_total).unwrap_or(u32::MAX));
         if total > cutoff {
             return total;
@@ -500,23 +656,9 @@ fn find_best_match_for_block(
     };
 
     for dy in min_offset_y..=max_offset_y {
-        let candidate_y = block_origin_y.saturating_add(dy);
-        if candidate_y < 0 {
-            continue;
-        }
-        let Ok(candidate_row) = usize::try_from(candidate_y) else {
-            continue;
-        };
-
+        let candidate_row = apply_search_offset(block_y, dy);
         for dx in min_offset_x..=max_offset_x {
-            let candidate_x = block_origin_x.saturating_add(dx);
-            if candidate_x < 0 {
-                continue;
-            }
-            let Ok(candidate_col) = usize::try_from(candidate_x) else {
-                continue;
-            };
-
+            let candidate_col = apply_search_offset(block_x, dx);
             let sad = sad16x16_with_cutoff(
                 prev,
                 curr,
@@ -540,6 +682,18 @@ fn find_best_match_for_block(
     best
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "search offsets are bounded by frame dimensions before this hot-loop helper"
+)]
+fn apply_search_offset(origin: usize, offset: i32) -> usize {
+    if offset < 0 {
+        origin.saturating_sub(offset.unsigned_abs() as usize)
+    } else {
+        origin.saturating_add(offset as usize)
+    }
+}
+
 fn dev_block(
     curr: &[u8],
     width: usize,
@@ -553,25 +707,59 @@ fn dev_block(
         return 0;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if block_w == BLOCK_EDGE && block_h == BLOCK_EDGE {
+        // SAFETY: motion-analysis callers only request in-bounds 16x16 blocks.
+        return unsafe { dev_block_16x16_sse2(curr, width, curr_x, curr_y) };
+    }
+
     let mut sum: u32 = 0;
-    let mut histogram = [0_u16; 256];
     for y in 0..block_h {
         let row = (curr_y + y).saturating_mul(width);
         for x in 0..block_w {
-            let pixel = curr[row + curr_x + x];
-            sum = sum.saturating_add(u32::from(pixel));
-            histogram[usize::from(pixel)] = histogram[usize::from(pixel)].saturating_add(1);
+            sum = sum.saturating_add(u32::from(curr[row + curr_x + x]));
         }
     }
 
     let mean = sum / u32::try_from(area).unwrap_or(u32::MAX);
-    histogram
-        .into_iter()
-        .enumerate()
-        .fold(0_u32, |acc, (value, count)| {
-            let value_u32 = u32::try_from(value).unwrap_or(u32::MAX);
-            acc.saturating_add(u32::from(count).saturating_mul(value_u32.abs_diff(mean)))
-        })
+    let mut dev = 0_u32;
+    for y in 0..block_h {
+        let row = (curr_y + y).saturating_mul(width);
+        for x in 0..block_w {
+            dev = dev.saturating_add(u32::from(curr[row + curr_x + x]).abs_diff(mean));
+        }
+    }
+    dev
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_loadu_si128 performs an unaligned load"
+)]
+unsafe fn dev_block_16x16_sse2(curr: &[u8], width: usize, curr_x: usize, curr_y: usize) -> u32 {
+    let zero = _mm_setzero_si128();
+    let mut sum = 0_u32;
+    for y in 0..BLOCK_EDGE {
+        let idx = (curr_y + y).saturating_mul(width) + curr_x;
+        let row = unsafe { _mm_loadu_si128(curr.as_ptr().add(idx).cast::<__m128i>()) };
+        let sad = _mm_sad_epu8(row, zero);
+        sum = sum.saturating_add(unsafe { sum_sad_lanes_u32(sad) });
+    }
+
+    let mean = sum / 256;
+    let mean_byte = u8::try_from(mean).unwrap_or(u8::MAX);
+    let mean_vector = _mm_set1_epi8(i8::from_ne_bytes([mean_byte]));
+    let mut dev = 0_u32;
+    for y in 0..BLOCK_EDGE {
+        let idx = (curr_y + y).saturating_mul(width) + curr_x;
+        let row = unsafe { _mm_loadu_si128(curr.as_ptr().add(idx).cast::<__m128i>()) };
+        let sad = _mm_sad_epu8(row, mean_vector);
+        dev = dev.saturating_add(unsafe { sum_sad_lanes_u32(sad) });
+    }
+
+    dev
 }
 
 fn superblock_indices(macroblock_count: usize) -> Vec<usize> {
@@ -703,8 +891,6 @@ fn search_superblock_matches(
     base_y: usize,
     search_window: SearchWindow,
 ) -> SuperblockSearchResults {
-    let base_col_i32 = i32::try_from(base_x).unwrap_or(i32::MAX);
-    let base_row_i32 = i32::try_from(base_y).unwrap_or(i32::MAX);
     let mut result = SuperblockSearchResults {
         sad: [u32::MAX; 4],
         dx: [0_i32; 4],
@@ -712,23 +898,9 @@ fn search_superblock_matches(
     };
 
     for offset_y in search_window.min_offset_y..=search_window.max_offset_y {
-        let candidate_y = base_row_i32.saturating_add(offset_y);
-        if candidate_y < 0 {
-            continue;
-        }
-        let Ok(candidate_row) = usize::try_from(candidate_y) else {
-            continue;
-        };
-
+        let candidate_row = apply_search_offset(base_y, offset_y);
         for offset_x in search_window.min_offset_x..=search_window.max_offset_x {
-            let candidate_x = base_col_i32.saturating_add(offset_x);
-            if candidate_x < 0 {
-                continue;
-            }
-            let Ok(candidate_col) = usize::try_from(candidate_x) else {
-                continue;
-            };
-
+            let candidate_col = apply_search_offset(base_x, offset_x);
             let block_sad_0 = sad16x16_with_cutoff(
                 prev,
                 curr,
@@ -1067,6 +1239,10 @@ pub fn meanalysis_xvid_like(
     if width < 32 || height < 32 {
         return empty_me_analysis();
     }
+    let needed = width.saturating_mul(height);
+    if prev.len() < needed || curr.len() < needed {
+        return empty_me_analysis();
+    }
 
     let mb_width = width.div_ceil(BLOCK_EDGE);
     let mb_height = height.div_ceil(BLOCK_EDGE);
@@ -1089,12 +1265,61 @@ pub fn meanalysis_xvid_like(
     })
 }
 
-fn load_u8x16(bytes: &[u8]) -> u8x16 {
-    let mut arr = [0_u8; 16];
-    arr.copy_from_slice(&bytes[..16]);
-    u8x16::new(arr)
+/// Sum of absolute differences over the first 16 bytes of each slice.
+///
+/// Callers must pass slices with at least 16 bytes.
+#[inline]
+fn sad16_bytes(prev: &[u8], curr: &[u8]) -> u64 {
+    debug_assert!(prev.len() >= 16);
+    debug_assert!(curr.len() >= 16);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is part of the x86_64 baseline target features.
+        unsafe { sad16_bytes_sse2(prev.as_ptr(), curr.as_ptr()) }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let a: [u8; 16] = prev[..16].try_into().expect("sliced to 16 bytes");
+        let b: [u8; 16] = curr[..16].try_into().expect("sliced to 16 bytes");
+        let a = u8x16::new(a);
+        let b = u8x16::new(b);
+        let diff = a.max(b) - a.min(b);
+        sum_u16x8(u16x8::from_u8x16_low(diff)) + sum_u16x8(u16x8::from_u8x16_high(diff))
+    }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_loadu_si128 performs an unaligned load"
+)]
+unsafe fn sad16_bytes_sse2(a: *const u8, b: *const u8) -> u64 {
+    let a = unsafe { _mm_loadu_si128(a.cast::<__m128i>()) };
+    let b = unsafe { _mm_loadu_si128(b.cast::<__m128i>()) };
+    let sad = _mm_sad_epu8(a, b);
+    unsafe { sum_sad_lanes_u64(sad) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn sum_sad_lanes_u64(sad: __m128i) -> u64 {
+    let low = _mm_cvtsi128_si64(sad).cast_unsigned();
+    let high = _mm_cvtsi128_si64(_mm_srli_si128::<8>(sad)).cast_unsigned();
+    low + high
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn sum_sad_lanes_u32(sad: __m128i) -> u32 {
+    u32::try_from(unsafe { sum_sad_lanes_u64(sad) }).unwrap_or(u32::MAX)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 fn sum_u16x8(v: u16x8) -> u64 {
     v.to_array().into_iter().map(u64::from).sum()
 }
@@ -1207,6 +1432,115 @@ mod tests {
     }
 
     #[test]
+    fn sad_u8_matches_scalar_reference() {
+        // 1003 is not a multiple of 16, so the tail path is covered too.
+        let prev = make_frame(1003, 3);
+        let curr: Vec<u8> = (0..1003_usize)
+            .map(|idx| u8::try_from((idx * 7 + 129) % 256).unwrap_or(0))
+            .collect();
+
+        let reference: u64 = prev
+            .iter()
+            .zip(&curr)
+            .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+            .sum();
+
+        assert_eq!(sad_u8(&prev, &curr), reference);
+    }
+
+    #[test]
+    fn planar16_scaling_maps_range_endpoints() {
+        let encode = |values: &[u16], le: bool| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|v| if le { v.to_le_bytes() } else { v.to_be_bytes() })
+                .collect()
+        };
+        let limited = Planar16Params {
+            bit_depth: 10,
+            little_endian: true,
+            full_range: false,
+        };
+        let values = [0_u16, 64, 502, 512, 940, 1023];
+        let mut dst = Vec::new();
+
+        // Limited range: 64 is black, 940 is white; the divide truncates, so
+        // the exact midpoint 502 (127.5) lands on 127.
+        extract_planar16_packed8(&encode(&values, true), 12, 6, 1, limited, &mut dst);
+        assert_eq!(dst, [0, 0, 127, 130, 255, 255]);
+
+        // Big-endian variant decodes to the same output.
+        let be = Planar16Params {
+            little_endian: false,
+            ..limited
+        };
+        extract_planar16_packed8(&encode(&values, false), 12, 6, 1, be, &mut dst);
+        assert_eq!(dst, [0, 0, 127, 130, 255, 255]);
+
+        // Full range: linear mapping over the whole code range.
+        let full = Planar16Params {
+            full_range: true,
+            ..limited
+        };
+        extract_planar16_packed8(&encode(&values, true), 12, 6, 1, full, &mut dst);
+        assert_eq!(dst, [0, 16, 125, 128, 234, 255]);
+    }
+
+    #[test]
+    fn fused_grid_distances_match_scalar_reference() {
+        let width: usize = 96;
+        let height: usize = 54;
+        let prev_frame = make_frame(width * height, 5);
+        let curr_frame = make_frame(width * height, 41);
+        let prev = grid_histogram_16(&prev_frame, width, height);
+        let curr = grid_histogram_16(&curr_frame, width, height);
+        let total = width * height;
+
+        // Independent scalar reference for both metrics.
+        let intersection: u64 = prev
+            .iter()
+            .zip(&curr)
+            .map(|(&a, &b)| u64::from(a.min(b)))
+            .sum();
+        let expected_global =
+            1.0 - u64_to_f64_exact(intersection) / u64_to_f64_exact(u64::try_from(total).unwrap());
+        let mut cell_distances: Vec<f64> = (0..GRID_HIST_X * GRID_HIST_Y)
+            .filter_map(|cell| {
+                let base = cell * 16;
+                let cell_intersection: u64 = (0..16)
+                    .map(|bin| u64::from(prev[base + bin].min(curr[base + bin])))
+                    .sum();
+                let cell_total: u64 = (0..16).map(|bin| u64::from(prev[base + bin])).sum();
+                (cell_total > 0).then(|| {
+                    1.0 - u64_to_f64_exact(cell_intersection) / u64_to_f64_exact(cell_total)
+                })
+            })
+            .collect();
+        cell_distances.sort_by(f64::total_cmp);
+        let mid = cell_distances.len() / 2;
+        let expected_median = if cell_distances.len() % 2 == 1 {
+            cell_distances[mid]
+        } else {
+            (cell_distances[mid - 1] + cell_distances[mid]) * 0.5
+        };
+
+        let (global, median) = grid_histogram_distances_16_from_hists(&prev, &curr, total);
+        assert!((global - expected_global).abs() < 1e-12);
+        assert!((median - expected_median).abs() < 1e-12);
+
+        // The single-metric wrappers must agree with the fused pair.
+        let wrapper_global = grid_histogram_distance_16_from_hists(&prev, &curr, total);
+        let wrapper_median = grid_histogram_median_cell_distance_16_from_hists(&prev, &curr);
+        assert!((global - wrapper_global).abs() < 1e-12);
+        assert!((median - wrapper_median).abs() < 1e-12);
+
+        // Zero pixels: no global distance, median still defined.
+        let (zero_global, zero_median) = grid_histogram_distances_16_from_hists(&prev, &curr, 0);
+        assert!(zero_global.abs() < f64::EPSILON);
+        assert!((zero_median - expected_median).abs() < 1e-12);
+    }
+
+    #[test]
     fn downscale_plan_matches_direct_path() {
         let src_width: usize = 64;
         let src_height: usize = 48;
@@ -1228,6 +1562,70 @@ mod tests {
         DownscalePlan::new(src_width, src_height, dst_width, dst_height).run(&frame, &mut planned);
 
         assert_eq!(planned, direct);
+    }
+
+    #[test]
+    fn exact_decimation_downscale_matches_nearest_mapping() {
+        let src_width: usize = 192;
+        let src_height: usize = 108;
+        let dst_width: usize = 16;
+        let dst_height: usize = 9;
+        let frame = make_frame(src_width * src_height, 37);
+        let mut expected = Vec::with_capacity(dst_width * dst_height);
+        for y in 0..dst_height {
+            let src_y = y * src_height / dst_height;
+            for x in 0..dst_width {
+                let src_x = x * src_width / dst_width;
+                expected.push(frame[src_y * src_width + src_x]);
+            }
+        }
+
+        let mut planned = Vec::new();
+        DownscalePlan::new(src_width, src_height, dst_width, dst_height).run(&frame, &mut planned);
+
+        assert_eq!(planned, expected);
+    }
+
+    #[test]
+    fn exact_decimation_planar16_downscale_matches_nearest_mapping() {
+        let src_width: usize = 8;
+        let src_height: usize = 4;
+        let dst_width: usize = 4;
+        let dst_height: usize = 2;
+        let params = Planar16Params {
+            bit_depth: 10,
+            little_endian: true,
+            full_range: true,
+        };
+        let values: Vec<u16> = (0..src_width * src_height)
+            .map(|idx| u16::try_from(idx * 23).expect("fits in u16"))
+            .collect();
+        let src: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+
+        let mut expected = Vec::with_capacity(dst_width * dst_height);
+        for y in 0..dst_height {
+            let src_y = y * src_height / dst_height;
+            for x in 0..dst_width {
+                let src_x = x * src_width / dst_width;
+                expected.push(scale_luma16_to_u8(
+                    values[src_y * src_width + src_x],
+                    params,
+                ));
+            }
+        }
+
+        let mut planned = Vec::new();
+        DownscalePlan::new(src_width, src_height, dst_width, dst_height).run_planar16_packed8(
+            &src,
+            src_width * 2,
+            params,
+            &mut planned,
+        );
+
+        assert_eq!(planned, expected);
     }
 
     #[test]
@@ -1316,6 +1714,15 @@ mod tests {
         assert!(analysis.total_blocks > 0);
         assert!(analysis.intra_blocks <= analysis.total_blocks);
         assert!(analysis.score > 0.0 || analysis.intra_blocks > 0);
+    }
+
+    #[test]
+    fn meanalysis_rejects_short_input_slices() {
+        let analysis = meanalysis_xvid_like(&[0_u8; 16], &[0_u8; 16], 64, 64, 4, 2000);
+        assert_eq!(analysis.total_blocks, 0);
+        assert_eq!(analysis.intra_blocks, 0);
+        assert_eq!(analysis.mc_sad, 0);
+        assert!(analysis.score.abs() < f64::EPSILON);
     }
 
     #[test]

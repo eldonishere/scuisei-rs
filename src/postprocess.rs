@@ -172,7 +172,8 @@ fn is_local_peak(values: &[f64], index: usize, radius: usize) -> bool {
 }
 
 fn initial_keyframes(stats: &[FrameCutStats], config: &PostprocessConfig) -> Vec<usize> {
-    let mut baseline = vec![0_usize];
+    let mut baseline = Vec::with_capacity(stats.len().saturating_add(1));
+    baseline.push(0);
     baseline.extend(
         stats
             .iter()
@@ -233,7 +234,7 @@ fn collect_candidates(
     burst_prefix: &[usize],
     config: &PostprocessConfig,
 ) -> Vec<CandidateMeta> {
-    let mut candidates: Vec<CandidateMeta> = Vec::new();
+    let mut candidates: Vec<CandidateMeta> = Vec::with_capacity(stats.len());
     for (index, stat) in stats.iter().enumerate() {
         let burst_count = burst_count_at_index(burst_prefix, index, blended.len(), config);
         let in_activity_burst = burst_count >= config.temporal_burst_min_count;

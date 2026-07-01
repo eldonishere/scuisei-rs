@@ -1,6 +1,6 @@
 [package]
 name = "scuisei-rs"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.93"
 description = "Scene-change detection library and CLI"
@@ -33,6 +33,7 @@ anyhow = "=1.0.95"
 pyo3 = { version = "=0.23.5", optional = true, features = ["extension-module", "abi3-py39"] }
 thiserror = "=2.0.11"
 rayon = "=1.10.0"
+indicatif = "=0.18.6"
 
 [dev-dependencies]
 assert_cmd = "=2.0.16"

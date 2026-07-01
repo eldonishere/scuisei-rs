@@ -36,6 +36,8 @@ pub struct AnalyzeOptions {
     pub hwdec: Option<String>,
     /// Emit per-frame debug scores to stderr.
     pub dump_scores: bool,
+    /// Show a progress bar on stderr while analyzing.
+    pub progress: bool,
     /// Motion-estimation detector settings.
     pub xvid_config: detector::XvidDetectorConfig,
     /// Adaptive detector settings.
@@ -118,20 +120,47 @@ impl PlanCache {
 /// Copy or downscale the frame's luma into an owned analysis-resolution
 /// buffer, returning the buffer's dimensions.
 fn prepare_analysis_pixels(
-    view: decoder::LumaView<'_>,
+    source: decoder::LumaSource<'_>,
     info: decoder::FrameInfo,
     native_res: bool,
     plans: &mut PlanCache,
     pixels: &mut Vec<u8>,
 ) -> (usize, usize) {
-    if native_res {
-        simd_metrics::extract_packed8(view.data, view.stride, info.width, info.height, pixels);
-        return (info.width, info.height);
-    }
+    match source {
+        decoder::LumaSource::Packed8(view) => {
+            if native_res {
+                simd_metrics::extract_packed8(
+                    view.data,
+                    view.stride,
+                    info.width,
+                    info.height,
+                    pixels,
+                );
+                return (info.width, info.height);
+            }
 
-    let plan = plans.downscale_plan(info.width, info.height);
-    plan.run_packed8(view.data, view.stride, pixels);
-    plan.dst_dimensions()
+            let plan = plans.downscale_plan(info.width, info.height);
+            plan.run_packed8(view.data, view.stride, pixels);
+            plan.dst_dimensions()
+        }
+        decoder::LumaSource::Planar16(view) => {
+            if native_res {
+                simd_metrics::extract_planar16_packed8(
+                    view.data,
+                    view.stride,
+                    info.width,
+                    info.height,
+                    view.params,
+                    pixels,
+                );
+                return (info.width, info.height);
+            }
+
+            let plan = plans.downscale_plan(info.width, info.height);
+            plan.run_planar16_packed8(view.data, view.stride, view.params, pixels);
+            plan.dst_dimensions()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -239,15 +268,12 @@ fn analyze_frame(
         &snapshot.hist,
         pixels.len(),
     );
-    let grid_hist_distance = simd_metrics::grid_histogram_distance_16_from_hists(
-        &state.prev_grid_hist,
-        &snapshot.grid_hist,
-        pixels.len(),
-    );
-    let grid_hist_median = simd_metrics::grid_histogram_median_cell_distance_16_from_hists(
-        &state.prev_grid_hist,
-        &snapshot.grid_hist,
-    );
+    let (grid_hist_distance, grid_hist_median) =
+        simd_metrics::grid_histogram_distances_16_from_hists(
+            &state.prev_grid_hist,
+            &snapshot.grid_hist,
+            pixels.len(),
+        );
 
     let sad_score = simd_metrics::normalize_sad(sad, snapshot.width, snapshot.height);
     let adaptive_score = adaptive_detector.blended_score(sad_score, hist_distance);
@@ -325,6 +351,61 @@ pub fn analyze_pass_decisions(options: &AnalyzeOptions) -> SCuiseiResult<Vec<boo
     analyze_video_impl(options, AnalysisTarget::PassDecisions).map(|result| result.pass_decisions)
 }
 
+/// Best-effort total frame count for progress reporting (header probe only).
+fn probe_frame_count(path: &std::path::Path) -> Option<u64> {
+    let ictx = ffmpeg_next::format::input(path).ok()?;
+    let stream = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
+    let frames = stream.frames();
+    if frames > 0 {
+        return u64::try_from(frames).ok();
+    }
+    let rate = stream.avg_frame_rate();
+    // Stream duration first; fall back to the container duration (AV_TIME_BASE
+    // units), which is all some containers (e.g. Matroska) report.
+    estimate_frames(stream.duration(), stream.time_base(), rate)
+        .or_else(|| estimate_frames(ictx.duration(), ffmpeg_next::rescale::TIME_BASE, rate))
+}
+
+/// `duration * time_base * rate` in integer math, truncated; `None` when any
+/// input is unset (ffmpeg reports unset durations as negative sentinels).
+fn estimate_frames(
+    duration: i64,
+    time_base: ffmpeg_next::Rational,
+    rate: ffmpeg_next::Rational,
+) -> Option<u64> {
+    let num =
+        i128::from(duration) * i128::from(time_base.numerator()) * i128::from(rate.numerator());
+    let den = i128::from(time_base.denominator()) * i128::from(rate.denominator());
+    if den <= 0 {
+        return None;
+    }
+    u64::try_from(num / den).ok().filter(|&frames| frames > 0)
+}
+
+fn make_progress_bar(options: &AnalyzeOptions) -> indicatif::ProgressBar {
+    // dump_scores streams CSV to stderr; a redrawing bar would clobber it.
+    if !options.progress || options.dump_scores {
+        return indicatif::ProgressBar::hidden();
+    }
+    if let Some(total) = probe_frame_count(&options.input) {
+        let bar = indicatif::ProgressBar::new(total);
+        bar.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{bar:40} {pos}/{len} frames ({per_sec}, ETA {eta})",
+            )
+            .expect("progress template must be valid"),
+        );
+        bar
+    } else {
+        let bar = indicatif::ProgressBar::new_spinner();
+        bar.set_style(
+            indicatif::ProgressStyle::with_template("{spinner} {pos} frames ({per_sec})")
+                .expect("progress template must be valid"),
+        );
+        bar
+    }
+}
+
 /// Per-frame detection driver shared by the pipelined and inline paths.
 struct DetectionRun<'a> {
     options: &'a AnalyzeOptions,
@@ -337,6 +418,7 @@ struct DetectionRun<'a> {
     curr_small: Vec<u8>,
     frame_stats: Vec<postprocess::FrameCutStats>,
     pass_decisions: Vec<bool>,
+    progress: indicatif::ProgressBar,
 }
 
 impl<'a> DetectionRun<'a> {
@@ -350,19 +432,23 @@ impl<'a> DetectionRun<'a> {
             extractor: decoder::LumaExtractor::new(),
             plans: PlanCache::new(),
             curr_small: Vec::new(),
-            frame_stats: Vec::new(),
-            pass_decisions: Vec::new(),
+            frame_stats: Vec::with_capacity(1024),
+            pass_decisions: Vec::with_capacity(1024),
+            progress: make_progress_bar(options),
         }
     }
 
     fn process_frame(&mut self, frame: &ffmpeg_next::frame::Video) -> SCuiseiResult<()> {
+        self.progress.inc(1);
         let info = decoder::FrameInfo {
             width: frame.width() as usize,
             height: frame.height() as usize,
         };
-        let view = self.extractor.luma_view(frame)?;
+        let source = self
+            .extractor
+            .luma_source(frame, !self.options.native_res)?;
         let (width, height) = prepare_analysis_pixels(
-            view,
+            source,
             info,
             self.options.native_res,
             &mut self.plans,
@@ -420,7 +506,7 @@ impl<'a> DetectionRun<'a> {
         Ok(())
     }
 
-    fn finish(self) -> AnalysisResult {
+    fn finish(mut self) -> AnalysisResult {
         let keyframes = if self.target.needs_keyframes() {
             postprocess::refine_frame_keyframes_with_config(
                 &self.frame_stats,
@@ -431,8 +517,15 @@ impl<'a> DetectionRun<'a> {
         };
         AnalysisResult {
             keyframes,
-            pass_decisions: self.pass_decisions,
+            pass_decisions: std::mem::take(&mut self.pass_decisions),
         }
+    }
+}
+
+impl Drop for DetectionRun<'_> {
+    /// Clears the progress bar on both success and mid-stream errors.
+    fn drop(&mut self) {
+        self.progress.finish_and_clear();
     }
 }
 
@@ -484,11 +577,29 @@ fn analyze_video_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_ffmpeg_initialized;
+    use super::{ensure_ffmpeg_initialized, estimate_frames};
 
     #[test]
     fn ffmpeg_initialization_is_idempotent() {
         assert!(ensure_ffmpeg_initialized().is_ok());
         assert!(ensure_ffmpeg_initialized().is_ok());
+    }
+
+    #[test]
+    fn estimate_frames_handles_ntsc_and_unset_inputs() {
+        let tb = ffmpeg_next::Rational(1, 1000);
+        let ntsc = ffmpeg_next::Rational(30000, 1001);
+        // 10s at 29.97 fps = 299.7, truncated.
+        assert_eq!(estimate_frames(10_000, tb, ntsc), Some(299));
+        // Unset duration (negative sentinel), zero rate, unset time base.
+        assert_eq!(estimate_frames(i64::MIN, tb, ntsc), None);
+        assert_eq!(
+            estimate_frames(10_000, tb, ffmpeg_next::Rational(0, 1)),
+            None
+        );
+        assert_eq!(
+            estimate_frames(10_000, ffmpeg_next::Rational(0, 0), ntsc),
+            None
+        );
     }
 }

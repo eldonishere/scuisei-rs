@@ -5,7 +5,11 @@ Intended for fansubbing (e.g. timing within Aegisub) but may have other uses.
 
 ## Build
 
-Requires Rust and FFmpeg development libraries (libavcodec/libavformat/libswscale + `pkg-config`).
+Requires Rust and FFmpeg development libraries.
+
+Linux/macOS builds normally use `pkg-config` for `libavcodec`, `libavformat`,
+`libavutil`, and `libswscale`. Windows builds can point `FFMPEG_DIR` at an
+FFmpeg shared build that contains `include`, `lib`, and `bin` directories.
 
 ```bash
 cargo build --release
@@ -20,12 +24,20 @@ $ ./scuisei-rs -i input.mp4 --format xvid -o output.pass
 $ ./scuisei-rs -i input.mp4 --format xvid --hwdec vaapi -o output.pass
 $ ./scuisei-rs -i input.mp4 --format frames -o frames.txt
 $ ./scuisei-rs -i input.mp4 --format frames > frames.txt
+$ ./scuisei-rs -i input.mp4 --progress -o output.agi
 $ ./scuisei-rs -i input.mp4 --native-res # slow - and default thresholds are tuned for the downsampled clip
 ```
 
 If `-o/--output` is omitted, output is written to stdout.
 
+`--progress` shows a progress bar on stderr while analyzing. It is disabled
+when `SCUISEI_DUMP_SCORES` is set, so score dumps stay readable.
+
 `--hwdec` keeps decode on the requested device when possible, but frames are still transferred back to CPU memory for analysis, so end-to-end speedups depend on the input and hardware stack.
+
+High-bit-depth planar YUV input is sampled directly in the default downscaled
+analysis path, avoiding a full-frame conversion before downscale. Native
+resolution analysis still converts to packed 8-bit luma before detection.
 
 ## Benchmarking
 
@@ -51,6 +63,7 @@ The script benchmarks `target/release/scuisei-rs -i <fixture> --format frames`, 
 use scuisei_rs::{AnalyzeOptions, PostprocessConfig, analyze_video};
 
 let mut options = AnalyzeOptions::defaults_for_input("input.mp4");
+options.progress = true;
 options.postprocess_config = PostprocessConfig::default();
 let result = analyze_video(&options)?;
 println!("{:?}", result.keyframes);
@@ -72,8 +85,8 @@ Python also exposes `scuisei_rs.PostprocessConfig()` for optional keyframe postp
 After updating `Cargo.toml`, `pyproject.toml`, and `Cargo.lock` to the same version and committing the changes, create and push a matching tag. The release workflow will attach the built artifacts to the corresponding GitHub Release.
 
 ```bash
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.7
+git push origin v0.1.7
 ```
 
 ## Disclaimer
