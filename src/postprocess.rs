@@ -277,24 +277,45 @@ fn collect_candidates(
     candidates
 }
 
+/// Pairwise cluster tie-break shared by cluster selection and dense-recovery
+/// slots so the two paths cannot drift apart. A cut-fallback marks the
+/// `ME`-detected onset of a transition burst: prefer the earliest fallback, but
+/// only when it precedes a stronger blend peak — that keeps fade/dissolve
+/// onsets without letting a weaker later `ME` cut steal a cluster after a hard
+/// cut. Callers must feed candidates in ascending frame order.
+fn candidate_beats_incumbent(
+    candidate: CandidateMeta,
+    incumbent: CandidateMeta,
+    stats: &[FrameCutStats],
+    blended: &[f64],
+) -> bool {
+    let cand_frame = stats[candidate.index].frame_index;
+    let best_frame = stats[incumbent.index].frame_index;
+    let cand_blend = blended[candidate.index];
+    let best_blend = blended[incumbent.index];
+
+    match (candidate.is_cut_fallback, incumbent.is_cut_fallback) {
+        (true, true) => cand_frame < best_frame,
+        (true, false) => cand_frame <= best_frame || cand_blend > best_blend,
+        (false, true) => cand_frame < best_frame && cand_blend > best_blend,
+        (false, false) => cand_blend > best_blend,
+    }
+}
+
 fn best_candidate_index(
     candidates: &[CandidateMeta],
     stats: &[FrameCutStats],
     blended: &[f64],
 ) -> Option<usize> {
-    if let Some(fallback) = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| candidate.is_cut_fallback)
-        .min_by_key(|candidate| stats[candidate.index].frame_index)
-    {
-        return Some(fallback.index);
+    let mut best: Option<CandidateMeta> = None;
+    for candidate in candidates.iter().copied() {
+        if best
+            .is_none_or(|incumbent| candidate_beats_incumbent(candidate, incumbent, stats, blended))
+        {
+            best = Some(candidate);
+        }
     }
-
-    candidates
-        .iter()
-        .max_by(|left, right| blended[left.index].total_cmp(&blended[right.index]))
-        .map(|candidate| candidate.index)
+    best.map(|candidate| candidate.index)
 }
 
 fn build_candidate_positions(stats_len: usize, candidates: &[CandidateMeta]) -> Vec<usize> {
@@ -353,18 +374,8 @@ fn should_replace_slot_candidate(
     stats: &[FrameCutStats],
     blended: &[f64],
 ) -> bool {
-    match current_best {
-        None => true,
-        Some(best) if candidate.is_cut_fallback && !best.is_cut_fallback => true,
-        Some(best) if candidate.is_cut_fallback == best.is_cut_fallback => {
-            if candidate.is_cut_fallback {
-                stats[candidate.index].frame_index < stats[best.index].frame_index
-            } else {
-                blended[candidate.index] > blended[best.index]
-            }
-        }
-        Some(_) => false,
-    }
+    current_best
+        .is_none_or(|incumbent| candidate_beats_incumbent(candidate, incumbent, stats, blended))
 }
 
 struct DenseRecoverySlotParams<'a> {
@@ -648,5 +659,87 @@ mod tests {
             let max_frame = stats.last().map_or(0, |item| item.frame_index);
             prop_assert!(keyframes.iter().all(|frame| *frame <= max_frame));
         }
+    }
+
+    fn quiet_stats(start: usize, end_inclusive: usize) -> Vec<FrameCutStats> {
+        (start..=end_inclusive)
+            .map(|frame| FrameCutStats {
+                frame_index: frame,
+                is_cut: false,
+                score: 10.0,
+                hist_distance: 0.01,
+                grid_hist_distance: 0.01,
+                grid_hist_median: 0.01,
+            })
+            .collect()
+    }
+
+    /// Hard cut followed by a weaker ME cut-fallback must not lose the hard cut.
+    #[test]
+    fn strong_hard_cut_wins_over_weaker_cut_fallback_in_cluster() {
+        let config = PostprocessConfig::default();
+        let mut stats = quiet_stats(1, 40);
+        stats.push(FrameCutStats {
+            frame_index: 41,
+            is_cut: true,
+            score: 279.0,
+            hist_distance: 0.897,
+            grid_hist_distance: 0.926,
+            grid_hist_median: 0.947,
+        });
+        stats.extend(quiet_stats(42, 48));
+        stats.push(FrameCutStats {
+            frame_index: 49,
+            is_cut: true,
+            score: 130.0,
+            hist_distance: 0.192,
+            grid_hist_distance: 0.589,
+            grid_hist_median: 0.584,
+        });
+        stats.extend(quiet_stats(50, 60));
+
+        let keyframes = refine_frame_keyframes_with_config(&stats, &config);
+        assert!(
+            keyframes.contains(&41),
+            "expected hard cut at 41 in {keyframes:?}"
+        );
+        assert!(
+            !keyframes.contains(&49),
+            "weaker later fallback must not replace hard cut: {keyframes:?}"
+        );
+    }
+
+    /// Early ME cut-fallback before a hist peak marks transition onset.
+    #[test]
+    fn early_cut_fallback_wins_before_later_hist_peak() {
+        let config = PostprocessConfig::default();
+        let mut stats = quiet_stats(1, 40);
+        // ME-only onset (hist flat) then a multi-frame hist burst (needs >=6
+        // activity samples in the temporal window for cut-fallback).
+        stats.push(FrameCutStats {
+            frame_index: 41,
+            is_cut: true,
+            score: 127.0,
+            hist_distance: 0.0,
+            grid_hist_distance: 0.0,
+            grid_hist_median: 0.0,
+        });
+        for (offset, frame) in (42..=49).enumerate() {
+            stats.push(FrameCutStats {
+                frame_index: frame,
+                is_cut: frame == 42 || frame == 48,
+                score: if frame == 42 { 184.0 } else { 110.0 },
+                hist_distance: 0.75 + f64::from(u16::try_from(offset).unwrap()) * 0.01,
+                grid_hist_distance: 0.76,
+                grid_hist_median: 0.78,
+            });
+        }
+        stats.extend(quiet_stats(50, 60));
+
+        let keyframes = refine_frame_keyframes_with_config(&stats, &config);
+        assert!(
+            keyframes.contains(&41),
+            "expected early cut-fallback onset at 41 in {keyframes:?}"
+        );
     }
 }

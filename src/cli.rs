@@ -115,7 +115,7 @@ pub struct Cli {
     #[arg(long, value_parser = parse_nonnegative_f64, default_value_t = DEFAULT_ME_INTRA_THRESH2)]
     pub me_intra_thresh2: f64,
 
-    /// Show a progress bar on stderr while analyzing (no-op when SCUISEI_DUMP_SCORES is set)
+    /// Show a progress bar on stderr while analyzing (no-op when `SCUISEI_DUMP_SCORES` is set)
     #[arg(long)]
     pub progress: bool,
 
